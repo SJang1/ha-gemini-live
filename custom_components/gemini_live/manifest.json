@@ -1,0 +1,12 @@
+{
+  "domain": "gemini_live",
+  "name": "Gemini Live Conversation",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["conversation", "media_player", "http", "frontend"],
+  "documentation": "https://github.com/your-repo/ha-gemini-live",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/your-repo/ha-gemini-live/issues",
+  "requirements": ["google-genai>=1.0.0"],
+  "version": "1.0.0"
+}

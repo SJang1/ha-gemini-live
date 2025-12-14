@@ -1,0 +1,150 @@
+send_message:
+  name: Send Message
+  description: Send a text message to Gemini Live API
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+    message:
+      name: Message
+      description: The text message to send
+      required: true
+      selector:
+        text:
+          multiline: true
+
+send_audio:
+  name: Send Audio
+  description: Send audio data to Gemini Live API
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+    audio:
+      name: Audio
+      description: Base64 encoded audio data (PCM 16kHz 16-bit mono)
+      required: true
+      selector:
+        text:
+
+start_listening:
+  name: Start Listening
+  description: Start listening for audio input
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+
+stop_listening:
+  name: Stop Listening
+  description: Stop listening for audio input
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+
+add_mcp_server:
+  name: Add MCP Server
+  description: Add an MCP server configuration
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+    name:
+      name: Server Name
+      description: Unique name for the MCP server
+      required: true
+      selector:
+        text:
+    type:
+      name: Server Type
+      description: Type of MCP server (sse or stdio)
+      required: true
+      selector:
+        select:
+          options:
+            - sse
+            - stdio
+    url:
+      name: URL
+      description: URL for SSE server
+      required: false
+      selector:
+        text:
+    command:
+      name: Command
+      description: Command for stdio server
+      required: false
+      selector:
+        text:
+    args:
+      name: Arguments
+      description: Arguments for stdio server command
+      required: false
+      selector:
+        object:
+
+remove_mcp_server:
+  name: Remove MCP Server
+  description: Remove an MCP server configuration
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+    name:
+      name: Server Name
+      description: Name of the MCP server to remove
+      required: true
+      selector:
+        text:
+
+list_mcp_servers:
+  name: List MCP Servers
+  description: List all configured MCP servers
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+
+connect_mcp_servers:
+  name: Connect MCP Servers
+  description: Connect to all configured MCP servers
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:
+
+clear_conversation:
+  name: Clear Conversation
+  description: Clear the conversation history
+  fields:
+    entry_id:
+      name: Entry ID
+      description: The config entry ID of the Gemini Live integration
+      required: true
+      selector:
+        text:

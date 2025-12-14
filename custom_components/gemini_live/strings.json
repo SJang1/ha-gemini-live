@@ -1,0 +1,168 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Gemini Live",
+        "description": "Enter your Google AI API key to connect to the Gemini Live API.",
+        "data": {
+          "api_key": "API Key"
+        },
+        "data_description": {
+          "api_key": "Your Google AI API key from https://aistudio.google.com/app/apikey"
+        }
+      },
+      "configure": {
+        "title": "Configuration",
+        "description": "Configure the Gemini Live settings.",
+        "data": {
+          "model": "Model",
+          "voice": "Voice",
+          "instructions": "System Instructions",
+          "temperature": "Temperature",
+          "enable_personalization": "Enable Personalization",
+          "enable_google_search": "Enable Google Search",
+          "enable_affective_dialog": "Enable Affective Dialog",
+          "enable_proactive_audio": "Enable Proactive Audio"
+        },
+        "data_description": {
+          "model": "The Gemini model to use for live conversations",
+          "voice": "The voice to use for audio responses",
+          "instructions": "System instructions for the AI assistant",
+          "temperature": "Controls randomness in responses (0.0-2.0)",
+          "enable_personalization": "When enabled, the service may use conversation content to personalize responses. Disabled by default for privacy.",
+          "enable_google_search": "Allow the AI to search the web using Google Search",
+          "enable_affective_dialog": "Enable emotional and expressive responses",
+          "enable_proactive_audio": "Enable proactive audio output"
+        }
+      },
+      "mcp_menu": {
+        "title": "MCP Servers",
+        "description": "Configure Model Context Protocol (MCP) servers for extended tool capabilities.",
+        "menu_options": {
+          "add_sse": "Add SSE Server",
+          "add_stdio": "Add Stdio Server",
+          "finish": "Finish Setup"
+        }
+      },
+      "mcp_add_sse": {
+        "title": "Add SSE MCP Server",
+        "description": "Add a Server-Sent Events MCP server.",
+        "data": {
+          "name": "Server Name",
+          "url": "Server URL"
+        },
+        "data_description": {
+          "name": "A unique name for this server",
+          "url": "The URL of the SSE MCP server"
+        }
+      },
+      "mcp_add_stdio": {
+        "title": "Add Stdio MCP Server",
+        "description": "Add a stdio MCP server that runs as a subprocess.",
+        "data": {
+          "name": "Server Name",
+          "command": "Command",
+          "args": "Arguments"
+        },
+        "data_description": {
+          "name": "A unique name for this server",
+          "command": "The command to run (e.g., npx, uvx)",
+          "args": "Command arguments (one per line)"
+        }
+      }
+    },
+    "personalization_confirm": {
+      "title": "Personalization - Confirm",
+      "description": "Enabling personalization may send additional conversation data to the external service to improve and personalize responses. Only enable if you accept the potential data handling implications.",
+      "data": {
+        "confirm_personalization": "I understand and accept the privacy implications"
+      }
+    },
+    "error": {
+      "invalid_api_key": "Invalid API key",
+      "cannot_connect": "Cannot connect to Gemini API",
+      "unknown": "Unknown error occurred"
+    },
+    "abort": {
+      "already_configured": "This integration is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options",
+        "description": "Configure Gemini Live options.",
+        "data": {
+          "model": "Model",
+          "voice": "Voice",
+          "instructions": "System Instructions",
+          "temperature": "Temperature",
+          "enable_google_search": "Enable Google Search",
+          "enable_affective_dialog": "Enable Affective Dialog",
+          "enable_proactive_audio": "Enable Proactive Audio"
+        }
+      },
+      "mcp_menu": {
+        "title": "MCP Servers",
+        "menu_options": {
+          "add_sse": "Add SSE Server",
+          "add_stdio": "Add Stdio Server",
+          "finish": "Save and Close"
+        }
+      },
+      "mcp_add_sse": {
+        "title": "Add SSE MCP Server",
+        "data": {
+          "name": "Server Name",
+          "url": "Server URL"
+        }
+      },
+      "mcp_add_stdio": {
+        "title": "Add Stdio MCP Server",
+        "data": {
+          "name": "Server Name",
+          "command": "Command",
+          "args": "Arguments"
+        }
+      }
+    }
+  },
+  "services": {
+    "send_message": {
+      "name": "Send Message",
+      "description": "Send a text message to the Gemini Live API."
+    },
+    "send_audio": {
+      "name": "Send Audio",
+      "description": "Send audio data to the Gemini Live API."
+    },
+    "start_listening": {
+      "name": "Start Listening",
+      "description": "Start listening for audio input."
+    },
+    "stop_listening": {
+      "name": "Stop Listening",
+      "description": "Stop listening for audio input."
+    },
+    "add_mcp_server": {
+      "name": "Add MCP Server",
+      "description": "Add an MCP server configuration."
+    },
+    "remove_mcp_server": {
+      "name": "Remove MCP Server",
+      "description": "Remove an MCP server configuration."
+    },
+    "list_mcp_servers": {
+      "name": "List MCP Servers",
+      "description": "List all configured MCP servers."
+    },
+    "connect_mcp_servers": {
+      "name": "Connect MCP Servers",
+      "description": "Connect to all configured MCP servers."
+    },
+    "clear_conversation": {
+      "name": "Clear Conversation",
+      "description": "Clear the conversation history."
+    }
+  }
+}
