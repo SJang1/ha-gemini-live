@@ -1,5 +1,5 @@
 {
-  "name": "AI Audio for Home Assistant",
+  "name": "Gemini Live for Home Assistant",
   "render_readme": true,
   "domains": ["conversation"],
   "homeassistant": "2024.1.0",

@@ -128,6 +128,8 @@ class GeminiLiveClient:
         # Current response tracking
         self._current_response: LiveResponse | None = None
         self._response_futures: dict[str, asyncio.Future] = {}
+        # Conversation history (stores completed LiveResponse objects)
+        self._conversation_history: list[LiveResponse] = []
 
         # Session resumption tracking
         self._session_resumption_handle: str | None = None
@@ -137,6 +139,10 @@ class GeminiLiveClient:
         self._go_away_time_left: int | None = None
         # Number of frontend/clients currently using this live session
         self._connection_count: int = 0
+        # Optional owner frontend websocket id (id(connection)) when this
+        # client was created for a specific websocket. May be None for
+        # shared/legacy clients.
+        self._owner_ws: int | None = None
 
     @property
     def connected(self) -> bool:
@@ -147,6 +153,12 @@ class GeminiLiveClient:
         """Register an event handler."""
         if event_type not in self._event_handlers:
             self._event_handlers[event_type] = []
+        # Avoid registering the same handler more than once
+        try:
+            if handler in self._event_handlers[event_type]:
+                return
+        except Exception:
+            pass
         self._event_handlers[event_type].append(handler)
 
     def off(self, event_type: str, handler: Callable) -> None:
@@ -159,8 +171,34 @@ class GeminiLiveClient:
 
     async def _emit(self, event_type: str, data: dict[str, Any]) -> None:
         """Emit an event to registered handlers."""
-        if event_type in self._event_handlers:
-            for handler in self._event_handlers[event_type]:
+        handlers = self._event_handlers.get(event_type, [])
+        _LOGGER.debug("Client %s emitting event '%s' to %d handlers (owner_ws=%s)", id(self), event_type, len(handlers), getattr(self, "_owner_ws", None))
+        # Debug: list handler identities and any websocket mapping attached
+        try:
+            for h in handlers:
+                try:
+                    mapping = getattr(h, "_ws_mapping", None)
+                except Exception:
+                    mapping = None
+                # If handler is a bound method, include the bound instance class/id
+                bound_info = None
+                try:
+                    bound_self = getattr(h, "__self__", None)
+                    if bound_self is not None:
+                        bound_info = f"{bound_self.__class__.__name__}@{id(bound_self)}"
+                except Exception:
+                    bound_info = None
+                _LOGGER.debug(
+                    "  handler id=%s qual=%s mapping=%s bound=%s",
+                    id(h),
+                    getattr(h, "__qualname__", str(h)),
+                    mapping,
+                    bound_info,
+                )
+        except Exception:
+            pass
+        if handlers:
+            for handler in handlers:
                 try:
                     if asyncio.iscoroutinefunction(handler):
                         await handler(data)
@@ -466,25 +504,40 @@ class GeminiLiveClient:
                                 _LOGGER.debug("Model turn has %d parts", len(model_turn.parts))
                                 for part in model_turn.parts:
                                     # Log what the part actually contains
-                                    _LOGGER.debug("Part: inline_data=%s, text=%s, function_call=%s",
-                                                 getattr(part, "inline_data", None) is not None,
-                                                 getattr(part, "text", None) is not None,
-                                                 getattr(part, "function_call", None) is not None)
+                                    try:
+                                        _LOGGER.debug(
+                                            "Part: inline_data=%s, inline_len=%s, text=%s, function_call=%s",
+                                            getattr(part, "inline_data", None) is not None,
+                                            len(getattr(part, "inline_data", {}).get("data", b"")) if getattr(part, "inline_data", None) else 0,
+                                            getattr(part, "text", None) is not None,
+                                            getattr(part, "function_call", None) is not None,
+                                        )
+                                    except Exception:
+                                        _LOGGER.debug("Part: unable to determine inline/text/function attributes")
                                     
                                     # Handle inline audio data - check for both inline_data and data attributes
                                     inline_data = getattr(part, "inline_data", None)
                                     if inline_data:
-                                        _LOGGER.debug("inline_data: mime_type=%s, data_len=%s", 
-                                                     getattr(inline_data, "mime_type", None),
-                                                     len(getattr(inline_data, "data", b"")))
-                                        audio_data = getattr(inline_data, "data", None)
-                                        if audio_data and isinstance(audio_data, bytes):
-                                            self._audio_in_queue.put_nowait(audio_data)
-                                            self._current_response.audio_data += audio_data
-                                            audio_b64 = base64.b64encode(audio_data).decode("utf-8")
-                                            # Don't await here to avoid blocking the loop
-                                            asyncio.create_task(self._emit(EVENT_AUDIO_DELTA, {"audio": audio_b64}))
-                                            _LOGGER.debug("Emitted audio_delta: %d bytes", len(audio_data))
+                                        try:
+                                            mime = getattr(inline_data, "mime_type", None)
+                                            data_bytes = getattr(inline_data, "data", None)
+                                            _LOGGER.debug("inline_data: mime_type=%s, data_type=%s, data_len=%s", mime, type(data_bytes), len(data_bytes) if data_bytes else 0)
+                                            audio_data = data_bytes
+                                            if audio_data and isinstance(audio_data, (bytes, bytearray)):
+                                                try:
+                                                    self._audio_in_queue.put_nowait(audio_data)
+                                                except Exception:
+                                                    _LOGGER.debug("Audio queue put_nowait failed; queue size may be overflowing")
+                                                self._current_response.audio_data += bytes(audio_data)
+                                                audio_b64 = base64.b64encode(bytes(audio_data)).decode("utf-8")
+                                                # Don't await here to avoid blocking the loop; schedule emission and log it
+                                                try:
+                                                    asyncio.create_task(self._emit(EVENT_AUDIO_DELTA, {"audio": audio_b64}))
+                                                    _LOGGER.debug("Scheduled EVENT_AUDIO_DELTA emit: %d bytes", len(audio_data))
+                                                except Exception as e:
+                                                    _LOGGER.error("Failed to schedule audio_delta emit: %s", e)
+                                        except Exception as e:
+                                            _LOGGER.error("Error processing inline_data part: %s", e)
 
                                     # Handle text
                                     text = getattr(part, "text", None)
@@ -517,6 +570,14 @@ class GeminiLiveClient:
                                     future = self._response_futures.pop(response_id)
                                     if not future.done():
                                         future.set_result(self._current_response)
+
+                            # Record completed response in conversation history
+                            try:
+                                if self._current_response:
+                                    # Keep a shallow copy to preserve the snapshot
+                                    self._conversation_history.append(self._current_response)
+                            except Exception:
+                                pass
 
                             await self._emit(EVENT_TURN_COMPLETE, {
                                 "transcript": self._current_response.audio_transcript if self._current_response else ""
@@ -785,7 +846,18 @@ class GeminiLiveClient:
 
     def get_conversation_history(self) -> list[ConversationItem]:
         """Get the conversation history."""
-        return []
+        try:
+            items: list[ConversationItem] = []
+            for resp in self._conversation_history:
+                parts = []
+                if resp.text:
+                    parts.append({"text": resp.text})
+                if resp.audio_transcript and resp.audio_transcript != resp.text:
+                    parts.append({"audio_transcript": resp.audio_transcript})
+                items.append(ConversationItem(id=resp.id, role="assistant", parts=parts, status=resp.status))
+            return items
+        except Exception:
+            return []
 
     def clear_conversation(self) -> None:
         """Clear the conversation history."""
@@ -840,6 +912,35 @@ class GeminiLiveClient:
             Seconds until termination, or None if no GoAway received.
         """
         return self._go_away_time_left
+
+    def set_owner_ws(self, owner_ws: int | None) -> None:
+        """Set the owning frontend websocket id for this client.
+
+        This can be used by the websocket layer to tag a per-connection
+        client with the frontend `id(connection)` that owns it. It is
+        primarily used for routing/debugging purposes.
+        """
+        try:
+            self._owner_ws = owner_ws
+        except Exception:
+            self._owner_ws = None
+
+    def get_ws_id(self, user_ws: int | None = None) -> int | None:
+        """Return this client's websocket id (object id) when queried.
+
+        If `user_ws` is provided the method will return the client's id
+        only if it matches the configured owner websocket (when set).
+        When `user_ws` is None this returns the client object id.
+        """
+        try:
+            if user_ws is None:
+                return id(self)
+            # If owner_ws is not set, we cannot verify ownership; return id
+            if self._owner_ws is None:
+                return id(self)
+            return id(self) if user_ws == self._owner_ws else None
+        except Exception:
+            return None
 
     @staticmethod
     async def create_ephemeral_token(

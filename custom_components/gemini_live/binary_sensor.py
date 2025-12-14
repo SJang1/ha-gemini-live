@@ -163,6 +163,13 @@ class GeminiLiveConnectedSensor(GeminiLiveBaseSensor):
     @property
     def is_on(self) -> bool:
         """Return true if connected."""
+        # For isolated clients per websocket, consider connected if any per-connection client is connected,
+        # otherwise fall back to legacy `client`.
+        clients = self._data.get("clients", {})
+        for cinfo in clients.values():
+            client = cinfo.get("client")
+            if client and getattr(client, "connected", False):
+                return True
         client = self._data.get("client")
         return client.connected if client else False
 

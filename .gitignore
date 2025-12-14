@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+ENV/
+.env
+.venv/
+
+# Testing, type checking, coverage
+.pytest_cache/
+.mypy_cache/
+.cache
+.coverage
+coverage.xml
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Home Assistant / local secrets
+.secrets.yaml
+home-assistant_v2.db
+.storage/

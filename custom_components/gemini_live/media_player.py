@@ -94,20 +94,62 @@ class GeminiLiveMediaPlayer(MediaPlayerEntity):
 
     async def async_added_to_hass(self) -> None:
         """Handle entity added to hass."""
-        client: GeminiLiveClient = self._data.get("client")
+        # Register to existing clients (per-connection) and legacy client
+        self._registered_clients: dict[int, GeminiLiveClient] = {}
 
-        if client:
-            # Register for audio events
-            client.on(EVENT_AUDIO_DELTA, self._handle_audio_delta)
-            client.on(EVENT_TURN_COMPLETE, self._handle_turn_complete)
+        def _register_client_obj(client_obj: GeminiLiveClient) -> None:
+            try:
+                client_obj.on(EVENT_AUDIO_DELTA, self._handle_audio_delta)
+                client_obj.on(EVENT_TURN_COMPLETE, self._handle_turn_complete)
+                self._registered_clients[id(client_obj)] = client_obj
+            except Exception:
+                _LOGGER.debug("Failed to register media player handlers for client")
+
+        # Register legacy client if present
+        legacy: GeminiLiveClient | None = self._data.get("client")
+        if legacy:
+            _register_client_obj(legacy)
+
+        # Register any per-connection clients
+        clients = self._data.get("clients", {})
+        for cinfo in clients.values():
+            cobj = cinfo.get("client")
+            if cobj:
+                _register_client_obj(cobj)
+
+        # Listen for newly created per-connection clients
+        @callback
+        def _handle_client_added(event) -> None:
+            if event.data.get("entry_id") != self._entry.entry_id:
+                return
+            uuid = event.data.get("client_uuid")
+            clients = self._data.get("clients", {})
+            cinfo = clients.get(uuid)
+            if cinfo:
+                cobj = cinfo.get("client")
+                if cobj:
+                    _register_client_obj(cobj)
+
+        self._client_added_unsub = self.hass.bus.async_listen(f"{DOMAIN}_client_added", _handle_client_added)
 
     async def async_will_remove_from_hass(self) -> None:
         """Handle entity removal."""
-        client: GeminiLiveClient = self._data.get("client")
+        # Unregister from all clients we registered
+        try:
+            for cobj in list(getattr(self, "_registered_clients", {}).values()):
+                try:
+                    cobj.off(EVENT_AUDIO_DELTA, self._handle_audio_delta)
+                    cobj.off(EVENT_TURN_COMPLETE, self._handle_turn_complete)
+                except Exception:
+                    pass
+        except Exception:
+            _LOGGER.debug("Error unregistering media player handlers")
 
-        if client:
-            client.off(EVENT_AUDIO_DELTA, self._handle_audio_delta)
-            client.off(EVENT_TURN_COMPLETE, self._handle_turn_complete)
+        if getattr(self, "_client_added_unsub", None):
+            try:
+                self._client_added_unsub()
+            except Exception:
+                pass
 
         if self._playback_task:
             self._playback_task.cancel()

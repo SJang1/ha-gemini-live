@@ -165,6 +165,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "mcp_handler": mcp_handler,
         "session_config": session_config,
         "ha_tools": ha_tools,
+        "api_key": config.get(CONF_API_KEY),
     }
 
     # Set up the conversation agent

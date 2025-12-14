@@ -97,6 +97,10 @@ class GeminiLiveCard extends HTMLElement {
         // Whether assistant output has started for the current turn
         this._outputHasStarted = false;
 
+        // AI speech detection state
+        this._aiSpeaking = false;
+        this._mutedByAi = false;
+
         // Bind cleanup handlers
         this._handleBeforeUnload = this._handleBeforeUnload.bind(this);
         this._handleVisibilityChange = this._handleVisibilityChange.bind(this);
@@ -186,10 +190,9 @@ class GeminiLiveCard extends HTMLElement {
         if (this._hass && this._connected) {
             try {
                 // Use sendMessage instead of callWS for synchronous behavior
-                this._hass.connection.sendMessage({
-                    type: `${DOMAIN}/disconnect`,
-                });
-                logWS('send', 'FORCE_DISCONNECT', {});
+                const payload = { type: `${DOMAIN}/disconnect`, ...this._getClientPayload() };
+                this._hass.connection.sendMessage(payload);
+                logWS('send', 'FORCE_DISCONNECT', payload);
             } catch (e) {
                 console.error("Failed to force disconnect:", e);
             }
@@ -229,15 +232,14 @@ class GeminiLiveCard extends HTMLElement {
         if (!this._hass) return;
 
         try {
-            logWS('send', 'SUBSCRIBE', {});
+            const payload = { type: `${DOMAIN}/subscribe`, ...this._getClientPayload() };
+            logWS('send', 'SUBSCRIBE', payload);
             this._subscription = await this._hass.connection.subscribeMessage(
                 (event) => {
                     logWS('recv', `EVENT:${event.type}`, event.data);
                     this._handleEvent(event);
                 },
-                {
-                    type: `${DOMAIN}/subscribe`,
-                }
+                payload
             );
             logWS('recv', 'SUBSCRIBED', { success: true });
         } catch (e) {
@@ -291,6 +293,26 @@ class GeminiLiveCard extends HTMLElement {
     _handleAudioDelta(data) {
         // Handle incoming audio for playback
         if (data.audio) {
+            // Detect AI speech start/stop and pause/resume mic sending accordingly.
+            try {
+                // If AI wasn't speaking, mark start now.
+                if (!this._aiSpeaking) {
+                    this._aiSpeaking = true;
+                    // If configured, mute mic sending while AI speaks. We achieve
+                    // this by setting `_speaking` so the audio processor will
+                    // early-return when attempting to send mic audio.
+                    if (this._muteWhileSpeaking && this._listening) {
+                        this._mutedByAi = true;
+                    }
+                    this._speaking = true;
+                    this._render();
+                }
+
+                // Rely on explicit TURN_COMPLETE events to clear AI speaking/mute state
+            } catch (e) {
+                console.debug("AI speech detection error:", e);
+            }
+
             // Don't log every audio chunk to reduce console spam
             this._playAudio(data.audio);
         }
@@ -425,6 +447,10 @@ class GeminiLiveCard extends HTMLElement {
         this._speaking = false;
         this._playbackStarted = false;
 
+        // Clear AI speaking/mute state (resume mic if muted by AI)
+        this._aiSpeaking = false;
+        this._mutedByAi = false;
+
         // Finalize the streaming message (prefer the tracked streaming index)
         const idx = this._currentStreamingIndex !== null ? this._currentStreamingIndex : this._messages.length - 1;
         const lastMessage = this._messages[idx];
@@ -498,23 +524,13 @@ class GeminiLiveCard extends HTMLElement {
     }
 
     _updateStates() {
+        // Do NOT read Home Assistant sensor entities for live status.
+        // The card is driven by websocket events emitted from the integration.
         if (!this._hass) return;
 
-        // Find the binary sensors by domain prefix
-        const states = this._hass.states || {};
-        for (const entityId of Object.keys(states)) {
-            if (entityId.startsWith(`binary_sensor.${DOMAIN}_`) && entityId.endsWith('_listening')) {
-                // Do not flip UI to listening if audio is still initializing locally.
-                const listeningState = states[entityId].state === "on";
-                this._listening = listeningState && !this._audioInitializing;
-            } else if (entityId.startsWith(`binary_sensor.${DOMAIN}_`) && entityId.endsWith('_speaking')) {
-                this._speaking = states[entityId].state === "on";
-            } else if (entityId.startsWith(`binary_sensor.${DOMAIN}_`) && entityId.endsWith('_connected')) {
-                this._connected = states[entityId].state === "on";
-            }
-        }
-        // If HA reports disconnected while UI still thinks it's listening,
-        // disable listening and clear buffered/input state so user input is not available.
+        // If the card believes it's listening but the websocket-driven
+        // connected flag is false, clear local listening state so the UI
+        // disables input until a websocket connect/session_resumed event.
         if (!this._connected && this._listening) {
             this._listening = false;
             this._pendingListen = false;
@@ -524,7 +540,6 @@ class GeminiLiveCard extends HTMLElement {
             this._bufferedOutput = "";
             this._outputTranscript = "";
             this._currentStreamingIndex = null;
-            // Optionally notify the user in UI
             this._addMessage("system", "Connection lost — input disabled until reconnected.");
             this._render();
         }
@@ -590,6 +605,15 @@ class GeminiLiveCard extends HTMLElement {
             const result = await this._hass.callWS(connectParams);
             logWS('recv', 'CONNECT_RESULT', result);
 
+            // Persist client_uuid for subsequent calls so the server can route correctly
+            if (result && result.client_uuid) {
+                this._clientUuid = result.client_uuid;
+                try {
+                    localStorage.setItem(`gemini_live_client_uuid`, result.client_uuid);
+                } catch (e) {}
+                logWS('recv', 'CLIENT_UUID_STORED', { client_uuid: result.client_uuid });
+            }
+
             this._connected = true;
             this._connecting = false;
             this._goAwayWarning = null;
@@ -631,10 +655,9 @@ class GeminiLiveCard extends HTMLElement {
         if (!this._hass) return;
 
         try {
-            logWS('send', 'DISCONNECT', {});
-            const result = await this._hass.callWS({
-                type: `${DOMAIN}/disconnect`,
-            });
+            const payload = { type: `${DOMAIN}/disconnect`, ...this._getClientPayload() };
+            logWS('send', 'DISCONNECT', payload);
+            const result = await this._hass.callWS(payload);
             logWS('recv', 'DISCONNECT_RESULT', result);
             this._connected = false;
             this._cleanupPlaybackAudio();
@@ -667,10 +690,9 @@ class GeminiLiveCard extends HTMLElement {
 
             // Call backend start_listening FIRST - this ensures connection is ready
             // The backend will auto-connect if needed
-            logWS('send', 'START_LISTENING', {});
-            const result = await this._hass.callWS({
-                type: `${DOMAIN}/start_listening`,
-            });
+            const payload = { type: `${DOMAIN}/start_listening`, ...this._getClientPayload() };
+            logWS('send', 'START_LISTENING_PAYLOAD', payload);
+            const result = await this._hass.callWS(payload);
             logWS('recv', 'START_LISTENING_RESULT', result);
 
             // Mark that audio initialization is starting so UI stays in loading state
@@ -701,10 +723,9 @@ class GeminiLiveCard extends HTMLElement {
         try {
             this._stopRecording();
 
-            logWS('send', 'STOP_LISTENING', {});
-            const result = await this._hass.callWS({
-                type: `${DOMAIN}/stop_listening`,
-            });
+            const payload = { type: `${DOMAIN}/stop_listening`, ...this._getClientPayload() };
+            logWS('send', 'STOP_LISTENING', payload);
+            const result = await this._hass.callWS(payload);
             logWS('recv', 'STOP_LISTENING_RESULT', result);
             this._listening = false;
             this._render();
@@ -758,7 +779,8 @@ class GeminiLiveCard extends HTMLElement {
             if (!this._listening) return;
 
             // Optionally mute mic while AI is speaking to prevent feedback
-            if (this._muteWhileSpeaking && this._speaking) return;
+            // Respect both playback-driven speaking and frontend-detected AI-mute
+            if (this._muteWhileSpeaking && (this._speaking || this._mutedByAi)) return;
 
             const inputData = e.inputBuffer.getChannelData(0);
 
@@ -792,6 +814,24 @@ class GeminiLiveCard extends HTMLElement {
         // Ensure connected state is in sync and re-render UI
         this._connected = this._connected || false;
         this._render();
+    }
+
+    // Helper to include client_uuid when calling backend
+    _getClientPayload() {
+        const payload = {};
+        try {
+            const storageKey = `gemini_live_client_uuid`;
+            const stored = localStorage.getItem(storageKey);
+            if (this._clientUuid) {
+                payload.client_uuid = this._clientUuid;
+            } else if (stored) {
+                this._clientUuid = stored;
+                payload.client_uuid = stored;
+            }
+        } catch (e) {
+            // ignore localStorage errors
+        }
+        return payload;
     }
 
     _resampleTo16kHz(inputData, fromRate, toRate) {
@@ -857,11 +897,9 @@ class GeminiLiveCard extends HTMLElement {
 
         try {
             // Log audio send (without the actual base64 data for brevity)
-            // logWS('send', 'SEND_AUDIO', { size: base64Audio.length });
-            await this._hass.callWS({
-                type: `${DOMAIN}/send_audio`,
-                audio: base64Audio,
-            });
+            const payload = { type: `${DOMAIN}/send_audio`, audio: base64Audio, ...this._getClientPayload() };
+            logWS('send', 'SEND_AUDIO', { size: base64Audio.length });
+            await this._hass.callWS(payload);
         } catch (e) {
             console.error("Failed to send audio:", e);
             logWS('recv', 'SEND_AUDIO_ERROR', { error: e.message });
@@ -876,10 +914,8 @@ class GeminiLiveCard extends HTMLElement {
             this._render();
 
             logWS('send', 'SEND_TEXT', { text: text });
-            const result = await this._hass.callWS({
-                type: `${DOMAIN}/send_text`,
-                text: text,
-            });
+            const payload = { type: `${DOMAIN}/send_text`, text: text, ...this._getClientPayload() };
+            const result = await this._hass.callWS(payload);
             logWS('recv', 'SEND_TEXT_RESULT', result);
 
             if (result.text || result.audio_transcript) {
@@ -1570,18 +1606,13 @@ class GeminiLiveCard extends HTMLElement {
                 try {
                     if (mimeType.startsWith("image/")) {
                         // Send image
-                        await this._hass.callWS({
-                            type: `${DOMAIN}/send_image`,
-                            image: base64,
-                            mime_type: mimeType,
-                        });
+                        const payload = { type: `${DOMAIN}/send_image`, image: base64, mime_type: mimeType, ...this._getClientPayload() };
+                        await this._hass.callWS(payload);
                         this._inputTranscript = `[Sent image: ${file.name}]`;
                     } else if (mimeType.startsWith("audio/")) {
                         // Send audio
-                        await this._hass.callWS({
-                            type: `${DOMAIN}/send_audio`,
-                            audio: base64,
-                        });
+                        const payload = { type: `${DOMAIN}/send_audio`, audio: base64, ...this._getClientPayload() };
+                        await this._hass.callWS(payload);
                         this._inputTranscript = `[Sent audio: ${file.name}]`;
                     }
                     this._render();
