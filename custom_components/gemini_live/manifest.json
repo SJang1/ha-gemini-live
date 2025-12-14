@@ -4,9 +4,9 @@
   "codeowners": [],
   "config_flow": true,
   "dependencies": ["conversation", "media_player", "http", "frontend"],
-  "documentation": "https://github.com/your-repo/ha-gemini-live",
+  "documentation": "https://github.com/SJang1/ha-gemini-live",
   "iot_class": "cloud_push",
-  "issue_tracker": "https://github.com/your-repo/ha-gemini-live/issues",
+  "issue_tracker": "https://github.com/SJang1/ha-gemini-live/issues",
   "requirements": ["google-genai>=1.0.0"],
-  "version": "1.0.0"
+  "version": "2.0.0"
 }

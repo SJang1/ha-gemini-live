@@ -21,6 +21,13 @@ try {
 
 function logWS(direction, type, data) {
     if (!DEBUG_LOG) return;
+    // Suppress very frequent audio send logs to avoid console spam
+    try {
+        const QUIET_LOG_TYPES = new Set(['SEND_AUDIO', 'FLUSH_SEND_AUDIO']);
+        if (QUIET_LOG_TYPES.has(type)) return;
+    } catch (e) {
+        // noop
+    }
     const timestamp = new Date().toISOString().substr(11, 12);
     const arrow = direction === 'send' ? '📤→' : '📥←';
     const color = direction === 'send' ? 'color: #4CAF50' : 'color: #2196F3';
@@ -86,6 +93,10 @@ class GeminiLiveCard extends HTMLElement {
         this._nextPlayTime = 0;  // For scheduled audio playback
         this._playbackStarted = false;  // Track if initial playback started
 
+        // Track dropped outgoing audio while disconnected and reconnect helpers
+        this._droppedAudioCount = 0;
+        this._reconnectAttempts = 0;
+        this._reconnectInProgress = false;
         // Pending listen request flag (true while awaiting backend confirmation)
         this._pendingListen = false;
         // Buffer for output_transcript chunks received before the user's final transcript
@@ -416,9 +427,9 @@ class GeminiLiveCard extends HTMLElement {
     _updateStreamingMessage(text) {
         // Find existing streaming message or create new one
         const lastMessage = this._messages[this._messages.length - 1];
-        if (lastMessage && lastMessage.role === "assistant" && lastMessage.streaming) {
+        if (lastMessage && lastMessage['role'] === "assistant" && lastMessage['streaming']) {
             // Update existing streaming message
-            lastMessage.text = text;
+            lastMessage['text'] = text;
         } else {
             // Create new streaming message
             this._messages.push({
@@ -445,7 +456,7 @@ class GeminiLiveCard extends HTMLElement {
 
         // Mark speaking as done when turn completes
         this._speaking = false;
-        this._playbackStarted = false;
+        // Do NOT reset `_playbackStarted` here — allow in-flight playback to finish
 
         // Clear AI speaking/mute state (resume mic if muted by AI)
         this._aiSpeaking = false;
@@ -456,11 +467,11 @@ class GeminiLiveCard extends HTMLElement {
         const lastMessage = this._messages[idx];
         // Use the full transcript if available
         const finalText = data.transcript || this._outputTranscript;
-        if (lastMessage && lastMessage.role === "assistant" && lastMessage.streaming) {
-            lastMessage.text = finalText;
-            lastMessage.streaming = false;
+        if (lastMessage && lastMessage['role'] === "assistant" && lastMessage['streaming']) {
+            lastMessage['text'] = finalText;
+            lastMessage['streaming'] = false;
         } else if (finalText && finalText.trim()) {
-            if (!(lastMessage && lastMessage.role === "assistant" && lastMessage.text === finalText)) {
+            if (!(lastMessage && lastMessage['role'] === "assistant" && lastMessage['text'] === finalText)) {
                 this._addMessage("assistant", finalText);
             }
         }
@@ -562,7 +573,7 @@ class GeminiLiveCard extends HTMLElement {
         try {
             const date = new Date(isoString);
             return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        } catch {
+        } catch (e) {
             return '';
         }
     }
@@ -895,6 +906,19 @@ class GeminiLiveCard extends HTMLElement {
     async _sendAudio(base64Audio) {
         if (!this._hass) return;
 
+        // If not connected, drop the audio (don't enqueue) and attempt reconnect
+        if (!this._connected) {
+            this._droppedAudioCount += 1;
+            // Notify user only on first drop to avoid spamming
+            if (this._droppedAudioCount === 1) {
+                this._addMessage("system", "Connection lost — outgoing audio will be dropped until reconnected.");
+                this._render();
+            }
+            // Start reconnect attempts in background
+            this._attemptReconnect();
+            return;
+        }
+
         try {
             // Log audio send (without the actual base64 data for brevity)
             const payload = { type: `${DOMAIN}/send_audio`, audio: base64Audio, ...this._getClientPayload() };
@@ -903,7 +927,57 @@ class GeminiLiveCard extends HTMLElement {
         } catch (e) {
             console.error("Failed to send audio:", e);
             logWS('recv', 'SEND_AUDIO_ERROR', { error: e.message });
+            // On failure, mark disconnected and drop subsequent outgoing audio until reconnect
+            this._handleSendFailure(e);
         }
+    }
+    async _attemptReconnect() {
+        // Do not run multiple concurrent reconnect loops
+        if (this._reconnectInProgress) return;
+        this._reconnectInProgress = true;
+
+        try {
+            // Exponential backoff with cap
+            while (!this._connected && this._reconnectAttempts < 8) {
+                const delay = Math.min(30000, 1000 * Math.pow(2, this._reconnectAttempts));
+                this._reconnectAttempts += 1;
+                logWS('recv', 'RECONNECT_ATTEMPT', { attempt: this._reconnectAttempts, delay });
+                // Try connecting
+                try {
+                    await this._connect();
+                } catch (e) {
+                    console.debug('Reconnect attempt failed:', e && e.message);
+                }
+
+                if (this._connected) break;
+                // Wait before next attempt
+                await new Promise(r => setTimeout(r, delay));
+            }
+
+            if (this._connected) {
+                // Reset dropped counter and inform user
+                if (this._droppedAudioCount > 0) {
+                    this._addMessage("system", `Reconnected. ${this._droppedAudioCount} outgoing audio chunks were dropped.`);
+                    this._droppedAudioCount = 0;
+                    this._render();
+                }
+                this._reconnectAttempts = 0;
+            }
+        } finally {
+            this._reconnectInProgress = false;
+        }
+    }
+
+    _handleSendFailure(e) {
+        // If server closed or deadline expired, mark disconnected and note drops
+        this._connected = false;
+        this._listening = false;
+        this._droppedAudioCount += 1;
+        // Start reconnect attempts
+        this._attemptReconnect();
+        // Notify user in UI
+        this._addMessage("system", `Failed to send audio: ${e && e.message ? e.message : 'unknown error'}`);
+        this._render();
     }
 
     async _sendText(text) {
