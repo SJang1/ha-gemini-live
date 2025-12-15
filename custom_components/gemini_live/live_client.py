@@ -439,8 +439,27 @@ class GeminiLiveClient:
             return True
 
         except Exception as e:
-            _LOGGER.error("Failed to connect to Gemini Live API: %s", e)
-            await self._emit(EVENT_ERROR, {"error": str(e)})
+            err_str = str(e)
+            _LOGGER.error("Failed to connect to Gemini Live API: %s", err_str)
+            await self._emit(EVENT_ERROR, {"error": err_str})
+
+            # If we attempted to resume a session but the server reports the
+            # resumption handle/session is not found (policy violation 1008),
+            # clear the handle and retry once without resumption to recover.
+            try:
+                if is_resuming and ("1008" in err_str or "session not found" in err_str.lower() or "policy violation" in err_str.lower()) and not getattr(self, "_retry_without_resumption_done", False):
+                    _LOGGER.warning("Resumption handle appears invalid; retrying connect without resumption handle")
+                    # Prevent further retries
+                    self._retry_without_resumption_done = True
+                    # Clear any configured resumption handle and retry
+                    try:
+                        self._session_config.session_resumption_handle = None
+                    except Exception:
+                        pass
+                    return await self.connect()
+            except Exception:
+                pass
+
             return False
 
     async def disconnect(self) -> None:
@@ -781,6 +800,52 @@ class GeminiLiveClient:
     async def send_audio_base64(self, audio_b64: str, sample_rate: int = 16000) -> None:
         """Send base64 encoded audio to the API."""
         audio_data = base64.b64decode(audio_b64)
+
+        # Detect common container formats (WAV) and convert to raw 16-bit PCM
+        try:
+            # WAV files start with the ASCII 'RIFF' or 'RIFX' header
+            if len(audio_data) >= 12 and (audio_data[:4] == b'RIFF' or audio_data[:4] == b'RIFX'):
+                import io
+                import wave
+                import audioop
+
+                _LOGGER.debug("send_audio_base64: detected WAV container, attempting to convert to raw PCM")
+                with wave.open(io.BytesIO(audio_data), 'rb') as wf:
+                    nchannels = wf.getnchannels()
+                    sampwidth = wf.getsampwidth()
+                    framerate = wf.getframerate()
+                    frames = wf.readframes(wf.getnframes())
+
+                # Convert sample width to 2 bytes (16-bit) if necessary
+                if sampwidth != 2:
+                    try:
+                        frames = audioop.lin2lin(frames, sampwidth, 2)
+                        sampwidth = 2
+                    except Exception as e:
+                        _LOGGER.debug("Failed to convert sample width: %s", e)
+
+                # Convert to mono if needed (mixing channels)
+                if nchannels != 1:
+                    try:
+                        frames = audioop.tomono(frames, 2, 1, 0)
+                        nchannels = 1
+                    except Exception as e:
+                        _LOGGER.debug("Failed to convert to mono: %s", e)
+
+                # Resample to target sample rate if needed
+                if framerate != sample_rate:
+                    try:
+                        frames, _ = audioop.ratecv(frames, 2, 1, framerate, sample_rate, None)
+                        framerate = sample_rate
+                    except Exception as e:
+                        _LOGGER.debug("Failed to resample audio: %s", e)
+
+                audio_data = frames
+
+        except Exception as e:
+            # If conversion fails, fall back to sending raw decoded bytes and log
+            _LOGGER.debug("send_audio_base64: WAV detection/conversion skipped: %s", e)
+
         await self.send_audio(audio_data, sample_rate)
 
     async def send_audio_stream_end(self) -> None:
