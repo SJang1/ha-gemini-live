@@ -11,14 +11,9 @@ const DOMAIN = "gemini_live";
 const DEBUG_LOG = true;
 
 // Runtime load marker for debugging
-try {
-        if (DEBUG_LOG && window && window.console) {
-        console.debug("GeminiLiveCard: module loaded (Gemini Live)");
-    }
-} catch (e) {
-    /* ignore */
+if (DEBUG_LOG && typeof window !== 'undefined' && window.console) {
+    console.debug("GeminiLiveCard: module loaded (Gemini Live)");
 }
-
 function logWS(direction, type, data) {
     if (!DEBUG_LOG) return;
     // Suppress very frequent audio send logs to avoid console spam
@@ -78,10 +73,13 @@ class GeminiLiveCard extends HTMLElement {
 
         // Connection state
         this._connecting = false;  // True while connection is being established
+        // UI helper: keep mic button in "connecting" visual state until audio initialized
+        this._showConnecting = false;
 
         // Audio processing
         this._mediaStream = null;
         this._audioProcessor = null;
+        this._inputObserver = null;
 
         // Index of the currently streaming assistant message in _messages (or null)
         this._currentStreamingIndex = null;
@@ -153,6 +151,42 @@ class GeminiLiveCard extends HTMLElement {
         window.addEventListener('beforeunload', this._handleBeforeUnload);
         document.addEventListener('visibilitychange', this._handleVisibilityChange);
 
+        // Watch for DOM mutations that affect the input element so we can log
+        // when it's removed/replaced (helps debug focus/typing loss)
+        try {
+            if (this.shadowRoot) {
+                this._inputObserver = new MutationObserver((mutations) => {
+                    mutations.forEach((m) => {
+                        if (m.type === 'childList') {
+                            m.removedNodes.forEach((n) => {
+                                try {
+                                    if (n && n.id === 'text-input') {
+                                        console.debug('INPUT_MUTATION: removed text-input node', { listening: this._listening, speaking: this._speaking, connected: this._connected });
+                                    }
+                                } catch (e) { }
+                            });
+                            m.addedNodes.forEach((n) => {
+                                try {
+                                    if (n && n.id === 'text-input') {
+                                        console.debug('INPUT_MUTATION: added text-input node', { listening: this._listening, speaking: this._speaking, connected: this._connected });
+                                    }
+                                } catch (e) { }
+                            });
+                        } else if (m.type === 'attributes') {
+                            try {
+                                const target = m.target;
+                                if (target && target.id === 'text-input') {
+                                    console.debug('INPUT_MUTATION: attribute changed on text-input', { attributeName: m.attributeName, listening: this._listening, speaking: this._speaking, connected: this._connected });
+                                }
+                            } catch (e) { }
+                        }
+                    });
+                });
+                this._inputObserver.observe(this.shadowRoot, { childList: true, subtree: true, attributes: true });
+            }
+        } catch (e) {
+            console.debug('Failed to create input MutationObserver', e);
+        }
         logWS('recv', 'CARD_CONNECTED', {});
     }
 
@@ -162,6 +196,14 @@ class GeminiLiveCard extends HTMLElement {
         // Remove event listeners
         window.removeEventListener('beforeunload', this._handleBeforeUnload);
         document.removeEventListener('visibilitychange', this._handleVisibilityChange);
+
+        // Disconnect input observer
+        try {
+            if (this._inputObserver) {
+                this._inputObserver.disconnect();
+                this._inputObserver = null;
+            }
+        } catch (e) { }
 
         // Cleanup subscriptions and audio
         this._cleanupSubscription();
@@ -685,6 +727,8 @@ class GeminiLiveCard extends HTMLElement {
         if (this._listening) return;  // Already listening
         // Mark that a listen request is pending until backend confirms
         this._pendingListen = true;
+        // Show connecting yellow state until audio initialization completes
+        this._showConnecting = true;
         this._render();
 
         try {
@@ -706,9 +750,21 @@ class GeminiLiveCard extends HTMLElement {
             const result = await this._hass.callWS(payload);
             logWS('recv', 'START_LISTENING_RESULT', result);
 
-            // Mark that audio initialization is starting so UI stays in loading state
-            this._audioInitializing = true;
-            this._render();
+            // If backend reports listening=true, show listening state immediately
+            // and clear the connecting yellow state — audio initialization will
+            // continue in the background.
+            if (result && result.listening) {
+                this._listening = true;
+                this._pendingListen = false;
+                this._showConnecting = false;
+                // Keep audioInitializing true until local audio setup completes
+                this._audioInitializing = true;
+                this._render();
+            } else {
+                // Mark that audio initialization is starting so UI stays in loading state
+                this._audioInitializing = true;
+                this._render();
+            }
 
             // Only start recording AFTER backend confirms it's ready
             await this._startRecording();
@@ -724,6 +780,7 @@ class GeminiLiveCard extends HTMLElement {
             logWS('recv', 'START_LISTENING_ERROR', { error: e.message });
             this._addMessage("system", `Failed to start: ${e.message}`);
             this._pendingListen = false;
+            this._showConnecting = false;
             this._render();
         }
     }
@@ -780,6 +837,12 @@ class GeminiLiveCard extends HTMLElement {
 
         console.log(`Audio: native=${nativeSampleRate}Hz, target=${targetSampleRate}Hz`);
 
+        // Audio is now initialized — stop showing connecting visual state
+        try {
+            this._audioInitializing = false;
+            this._showConnecting = false;
+        } catch (e) { }
+
         const source = this._audioContext.createMediaStreamSource(this._mediaStream);
 
         // Use ScriptProcessor for wider compatibility
@@ -787,11 +850,22 @@ class GeminiLiveCard extends HTMLElement {
         const processor = this._audioContext.createScriptProcessor(bufferSize, 1, 1);
 
         processor.onaudioprocess = (e) => {
-            if (!this._listening) return;
+            try {
+                // Log that onaudioprocess fired
+                console.debug('AUDIO_PROCESS: onaudioprocess', { listening: this._listening, speaking: this._speaking, mutedByAi: this._mutedByAi, muteWhileSpeaking: this._muteWhileSpeaking });
+            } catch (e) { }
+
+            if (!this._listening) {
+                try { console.debug('AUDIO_PROCESS: skipping because not listening'); } catch (e) {}
+                return;
+            }
 
             // Optionally mute mic while AI is speaking to prevent feedback
             // Respect both playback-driven speaking and frontend-detected AI-mute
-            if (this._muteWhileSpeaking && (this._speaking || this._mutedByAi)) return;
+            if (this._muteWhileSpeaking && (this._speaking || this._mutedByAi)) {
+                try { console.debug('AUDIO_PROCESS: muted due to speaking/ai', { speaking: this._speaking, mutedByAi: this._mutedByAi }); } catch (e) {}
+                return;
+            }
 
             const inputData = e.inputBuffer.getChannelData(0);
 
@@ -806,6 +880,7 @@ class GeminiLiveCard extends HTMLElement {
 
             // Convert to base64 and send
             const base64Audio = this._arrayBufferToBase64(pcmData);
+            try { console.debug('AUDIO_PROCESS: sending audio chunk', { base64Length: base64Audio.length }); } catch (e) {}
             this._sendAudio(base64Audio);
         };
 
@@ -904,6 +979,7 @@ class GeminiLiveCard extends HTMLElement {
     }
 
     async _sendAudio(base64Audio) {
+        try { console.debug('SEND_AUDIO_CALL', { connected: this._connected, base64Length: (base64Audio && base64Audio.length) || 0 }); } catch (e) {}
         if (!this._hass) return;
 
         // If not connected, drop the audio (don't enqueue) and attempt reconnect
@@ -1093,6 +1169,22 @@ class GeminiLiveCard extends HTMLElement {
         const title = this._config.title || "Gemini Live";
         const showTranscript = this._config.show_transcript !== false;
 
+        // Preserve text input state across re-renders to avoid blocking typing
+        let _preservedInput = null;
+        try {
+            const existingInput = this.shadowRoot && this.shadowRoot.getElementById && this.shadowRoot.getElementById("text-input");
+            if (existingInput) {
+                _preservedInput = {
+                    value: existingInput.value,
+                    selectionStart: existingInput.selectionStart,
+                    selectionEnd: existingInput.selectionEnd,
+                    focused: (this.shadowRoot && this.shadowRoot.activeElement === existingInput),
+                };
+                console.debug('RENDER: preserving input', { valueLength: (existingInput.value || '').length, focused: _preservedInput.focused, listening: this._listening, speaking: this._speaking, connected: this._connected });
+            }
+        } catch (e) {
+            _preservedInput = null;
+        }
         // Determine status
         let statusText = "Disconnected";
         let statusClass = "";
@@ -1111,6 +1203,97 @@ class GeminiLiveCard extends HTMLElement {
             statusText = "Connected";
             statusClass = "connected";
         }
+        
+        // If connected and actively listening or speaking, DO NOT replace or
+        // modify the text input element at all — updating it causes the browser
+        // to steal focus and block typing. Instead, perform minimal DOM updates
+        // to keep the UI in sync while leaving the input untouched.
+        try {
+            const shouldAvoidReplace = this._connected && (this._listening || this._speaking);
+            if (shouldAvoidReplace && this.shadowRoot && this.shadowRoot.children.length > 0) {
+                console.debug('RENDER: performing partial update (avoiding full shadowRoot replace)', { listening: this._listening, speaking: this._speaking, connected: this._connected });
+                // Update status dot and text
+                const statusDotEl = this.shadowRoot.querySelector('.status .status-dot');
+                if (statusDotEl) {
+                    statusDotEl.className = `status-dot ${statusClass}`;
+                }
+                const statusTextEl = this.shadowRoot.querySelector('.status span');
+                if (statusTextEl) {
+                    statusTextEl.textContent = statusText;
+                }
+
+                // Update visualizer visibility
+                const visualizer = this.shadowRoot.getElementById('visualizer');
+                if (visualizer) {
+                    visualizer.style.display = this._listening ? '' : 'none';
+                    // If rendering bars for the first time, ensure they exist
+                    if (visualizer.children.length === 0) {
+                        visualizer.innerHTML = Array(20).fill(0).map(() => '<div class="visualizer-bar" style="height: 5px;"></div>').join('');
+                    }
+                }
+
+                // Update mic button class/disabled state without touching its inner markup
+                const micButton = this.shadowRoot.getElementById('mic-button');
+                if (micButton) {
+                        // Keep connecting visual when explicit _showConnecting set
+                        const shouldShowConnecting = !!(this._showConnecting || this._connecting || this._pendingListen || this._audioInitializing);
+                        micButton.classList.toggle('connecting', shouldShowConnecting);
+                    micButton.classList.toggle('listening', !!this._listening && !(this._connecting || this._pendingListen || this._audioInitializing));
+                    micButton.disabled = !!(this._connecting || this._pendingListen || this._audioInitializing);
+                }
+
+                // Update chat messages (safe: does not touch input element)
+                const chatContainer = this.shadowRoot.getElementById('chat-container');
+                if (chatContainer) {
+                    if (this._messages.length === 0) {
+                        chatContainer.innerHTML = `<div class="chat-message system">Start a conversation...</div>`;
+                    } else {
+                        chatContainer.innerHTML = this._messages.map(msg => `\n                            <div class="chat-message ${msg.role}${msg.streaming ? ' streaming' : ''}">\n                                ${msg.text}${msg.streaming ? '<span class="streaming-cursor">▌</span>' : ''}\n                                ${msg.role !== 'system' ? `<span class="timestamp">${this._formatTime(msg.timestamp)}</span>` : ''}\n                            </div>\n                        `).join('');
+                    }
+
+                    // Live transcript bubble (only if listening)
+                    if (this._inputTranscript && this._listening) {
+                        const live = document.createElement('div');
+                        live.className = 'live-transcript';
+                        live.textContent = this._inputTranscript + '...';
+                        // remove previous live-transcript if exists
+                        const prev = chatContainer.querySelector('.live-transcript');
+                        if (prev) prev.remove();
+                        chatContainer.appendChild(live);
+                    } else {
+                        const prev = chatContainer.querySelector('.live-transcript');
+                        if (prev) prev.remove();
+                    }
+                }
+
+                // Update file name display if present
+                const fileNameEl = this.shadowRoot.getElementById('file-name');
+                if (fileNameEl) {
+                    fileNameEl.textContent = this._selectedFile ? this._selectedFile.name : '';
+                }
+
+                // Update mute toggle visual state
+                const muteToggle = this.shadowRoot.getElementById('mute-toggle');
+                if (muteToggle) {
+                    muteToggle.classList.toggle('active', this._muteWhileSpeaking);
+                }
+
+                // Update send button disabled state without altering the input
+                const sendBtn = this.shadowRoot.getElementById('send-btn');
+                if (sendBtn) {
+                    sendBtn.disabled = !this._connected;
+                }
+
+                // Scroll chat to bottom after updates
+                this._scrollChatToBottom();
+
+                return;
+            }
+        } catch (e) {
+            // Fall back to full render if partial update fails
+        }
+
+        console.debug('RENDER: performing full shadowRoot replace', { listening: this._listening, speaking: this._speaking, connected: this._connected, preservedInput: !!_preservedInput });
 
         this.shadowRoot.innerHTML = `
             <style>
@@ -1175,6 +1358,11 @@ class GeminiLiveCard extends HTMLElement {
                     0%, 100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.4); }
                     50% { box-shadow: 0 0 0 20px rgba(244, 67, 54, 0); }
                 }
+
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
                 
                 .visualizer {
                     display: flex;
@@ -1205,6 +1393,7 @@ class GeminiLiveCard extends HTMLElement {
                     border: none;
                     background-color: var(--primary-color);
                     color: white;
+                    position: relative; /* needed for loading ring */
                     cursor: pointer;
                     display: flex;
                     align-items: center;
@@ -1222,9 +1411,26 @@ class GeminiLiveCard extends HTMLElement {
                 }
                 
                 .mic-button.connecting {
-                    background-color: var(--warning-color, #ff9800);
+                    /* Make connecting state clearly yellow */
+                    background-color: #FFC107; /* amber/yellow */
+                    color: rgba(0,0,0,0.85);
                     cursor: wait;
                     animation: pulse-button 1s infinite;
+                }
+
+                .mic-button.connecting::after {
+                    content: '';
+                    position: absolute;
+                    top: -8px;
+                    left: -8px;
+                    right: -8px;
+                    bottom: -8px;
+                    border-radius: 50%;
+                    border: 4px solid rgba(255, 193, 7, 0.20);
+                    border-top-color: rgba(255, 193, 7, 1);
+                    pointer-events: none;
+                    animation: spin 1s linear infinite;
+                    box-sizing: content-box;
                 }
                 
                 .mic-button.connecting:hover {
@@ -1588,6 +1794,25 @@ class GeminiLiveCard extends HTMLElement {
         // Add event listeners
         this._addEventListeners();
 
+        // Restore preserved input state (value, selection, focus) after re-render
+        try {
+            if (_preservedInput) {
+                const newInput = this.shadowRoot.getElementById("text-input");
+                if (newInput) {
+                    newInput.value = _preservedInput.value || "";
+                    try {
+                        if (typeof newInput.setSelectionRange === 'function' && _preservedInput.selectionStart !== null && _preservedInput.selectionEnd !== null) {
+                            newInput.setSelectionRange(_preservedInput.selectionStart, _preservedInput.selectionEnd);
+                        }
+                    } catch (e) { /* ignore */ }
+                    if (_preservedInput.focused) {
+                        try { newInput.focus(); } catch (e) { /* ignore */ }
+                    }
+                }
+            }
+        } catch (e) {
+            // ignore restore failures
+        }
         // Scroll chat to bottom
         this._scrollChatToBottom();
     }
@@ -1619,6 +1844,22 @@ class GeminiLiveCard extends HTMLElement {
                     textInput.value = "";
                 }
             });
+
+            // Log input events to help diagnose typing being blocked or input disappearing
+            try {
+                textInput.addEventListener('input', (ev) => {
+                    try {
+                        console.debug('INPUT_EVENT: input', { valueLength: textInput.value.length, selectionStart: textInput.selectionStart, selectionEnd: textInput.selectionEnd, focused: document.activeElement === textInput });
+                    } catch (e) { }
+                });
+                textInput.addEventListener('focus', () => console.debug('INPUT_EVENT: focus'));
+                textInput.addEventListener('blur', () => console.debug('INPUT_EVENT: blur'));
+                textInput.addEventListener('keydown', (ev) => {
+                    if (ev.key && ev.key.length === 1) {
+                        console.debug('INPUT_EVENT: keydown', { key: ev.key, code: ev.code });
+                    }
+                });
+            } catch (e) { console.debug('Failed to attach input event listeners', e); }
         }
 
         // Send button

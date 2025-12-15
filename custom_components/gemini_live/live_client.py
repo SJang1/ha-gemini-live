@@ -237,21 +237,43 @@ class GeminiLiveClient:
         if not params:
             return None
 
-        param_type = params.get("type", "object").upper()
+        def schema_from_dict(d: dict) -> types.Schema:
+            ptype = d.get("type", "object").upper()
+            description = d.get("description", "")
 
-        properties = {}
-        for prop_name, prop_def in params.get("properties", {}).items():
-            prop_type = prop_def.get("type", "string").upper()
-            properties[prop_name] = types.Schema(
-                type=getattr(types.Type, prop_type, types.Type.STRING),
-                description=prop_def.get("description", ""),
+            # Array type: convert items recursively
+            if ptype == "ARRAY":
+                items = d.get("items")
+                item_schema = schema_from_dict(items) if isinstance(items, dict) else None
+                return types.Schema(
+                    type=getattr(types.Type, "ARRAY", types.Type.ARRAY),
+                    items=item_schema,
+                    description=description,
+                )
+
+            # Object type: convert properties recursively
+            if ptype == "OBJECT":
+                props = {}
+                for k, v in d.get("properties", {}).items():
+                    props[k] = schema_from_dict(v)
+                return types.Schema(
+                    type=getattr(types.Type, "OBJECT", types.Type.OBJECT),
+                    properties=props,
+                    required=d.get("required", []),
+                    description=description,
+                )
+
+            # Primitive types
+            return types.Schema(
+                type=getattr(types.Type, ptype, types.Type.STRING),
+                description=description,
             )
 
-        return types.Schema(
-            type=getattr(types.Type, param_type, types.Type.OBJECT),
-            properties=properties,
-            required=params.get("required", []),
-        )
+        try:
+            return schema_from_dict(params)
+        except Exception as e:
+            _LOGGER.debug("Failed to convert parameters schema: %s", e)
+            return None
 
     def _build_config(self) -> types.LiveConnectConfig:
         """Build LiveConnectConfig for the session."""
