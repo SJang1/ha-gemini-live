@@ -274,32 +274,32 @@ class GeminiLiveClient:
                     desc = f.get("description") or (f.get("annotations") or {}).get("title") or ""
                     params = f.get("parameters") or f.get("inputSchema") or f.get("input_schema") or {}
                     
-                    # Add a CONCISE parameter summary to help the model understand how to call the function.
-                    # This replaces the old approach of appending str(f) which caused 65k+ token bloat.
-                    try:
-                        props = params.get("properties", {}) if isinstance(params, dict) else {}
-                        required = params.get("required", []) if isinstance(params, dict) else []
-                        if props and isinstance(props, dict):
-                            # Build concise summary: "Parameters: param1 (type, required), param2 (type)"
-                            param_parts = []
-                            for pname, pdef in props.items():
-                                ptype = pdef.get("type", "any") if isinstance(pdef, dict) else "any"
-                                pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
-                                is_req = pname in required
-                                # Keep param description short (first 50 chars)
-                                if pdesc and len(pdesc) > 50:
-                                    pdesc = pdesc[:47] + "..."
-                                if is_req:
-                                    param_parts.append(f"{pname}: {ptype} (required){' - ' + pdesc if pdesc else ''}")
-                                else:
-                                    param_parts.append(f"{pname}: {ptype}{' - ' + pdesc if pdesc else ''}")
-                            if param_parts:
-                                # Limit to first 10 params to avoid bloat
-                                if len(param_parts) > 10:
-                                    param_parts = param_parts[:10] + [f"... and {len(param_parts) - 10} more"]
-                                desc = desc.rstrip() + " | Params: " + "; ".join(param_parts)
-                    except Exception:
-                        pass
+                    # # Add a CONCISE parameter summary to help the model understand how to call the function.
+                    # # This replaces the old approach of appending str(f) which caused 65k+ token bloat.
+                    # try:
+                    #     props = params.get("properties", {}) if isinstance(params, dict) else {}
+                    #     required = params.get("required", []) if isinstance(params, dict) else []
+                    #     if props and isinstance(props, dict):
+                    #         # Build concise summary: "Parameters: param1 (type, required), param2 (type)"
+                    #         param_parts = []
+                    #         for pname, pdef in props.items():
+                    #             ptype = pdef.get("type", "any") if isinstance(pdef, dict) else "any"
+                    #             pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
+                    #             is_req = pname in required
+                    #             # Keep param description short (first 50 chars)
+                    #             if pdesc and len(pdesc) > 50:
+                    #                 pdesc = pdesc[:47] + "..."
+                    #             if is_req:
+                    #                 param_parts.append(f"{pname}: {ptype} (required){' - ' + pdesc if pdesc else ''}")
+                    #             else:
+                    #                 param_parts.append(f"{pname}: {ptype}{' - ' + pdesc if pdesc else ''}")
+                    #         if param_parts:
+                    #             # Limit to first 10 params to avoid bloat
+                    #             if len(param_parts) > 10:
+                    #                 param_parts = param_parts[:10] + [f"... and {len(param_parts) - 10} more"]
+                    #             desc = desc.rstrip() + " | Params: " + "; ".join(param_parts)
+                    # except Exception:
+                    #     pass
                     
                     # Ensure parameters is a dict with properties we can augment
 
@@ -1298,65 +1298,21 @@ class GeminiLiveClient:
             _LOGGER.error("Error handling tool call: %s", e)
 
     def _extract_mcp_result(self, response: Any) -> Any:
-        """Extract the actual result content from an MCP JSON-RPC response.
+        """Pass through the raw MCP response without parsing.
 
         MCP servers return responses in JSON-RPC format like:
         {"jsonrpc": "2.0", "id": 123, "result": {"content": [...], "isError": False}}
 
-        The text field often contains a JSON string like:
-        {"success": true, "result": "Live Context: ..."}
-
-        Gemini's Live API expects a simple result object like {"result": "text"}.
-        This method extracts the meaningful content and flattens nested JSON.
+        This method now sends the complete raw response to Gemini, preserving
+        all metadata, structure, and content exactly as the MCP server returned it.
         """
-        if not isinstance(response, dict):
-            return {"result": str(response)}
-
-        # Check if this is a JSON-RPC response (has jsonrpc key)
-        if "jsonrpc" in response:
-            # Extract the result field
-            result = response.get("result")
-            if result is None:
-                # Check for error
-                error = response.get("error")
-                if error:
-                    error_str = str(error) if not isinstance(error, str) else error
-                    return {"error": error_str}
-                return {"result": "No result returned"}
-
-            # If result has MCP content format, extract text content
-            if isinstance(result, dict):
-                content = result.get("content")
-                _LOGGER.debug("_extract_mcp_result: result is dict, content type=%s", 
-                             type(content).__name__ if content else "None")
-                if isinstance(content, list):
-                    # Extract text from content items
-                    texts = []
-                    for i, item in enumerate(content):
-                        if isinstance(item, dict):
-                            text_value = item.get("text", "")
-                            _LOGGER.debug("_extract_mcp_result: item[%d] text_value type=%s len=%d first100=%s", 
-                                         i, type(text_value).__name__, len(text_value) if text_value else 0,
-                                         repr(text_value[:100]) if text_value else "empty")
-                            if text_value:
-                                # The text might be a JSON string - try to parse and extract
-                                extracted_text = self._unwrap_json_text(text_value)
-                                _LOGGER.debug("_extract_mcp_result: extracted_text len=%d first100=%s",
-                                             len(extracted_text), repr(extracted_text))
-                                texts.append(extracted_text)
-                    if texts:
-                        # Join all text content with newlines
-                        joined = "\n".join(texts)
-                        _LOGGER.debug("_extract_mcp_result: returning joined result len=%d", len(joined))
-                        return {"result": joined}
-
-                # Return the result as a string representation
-                return {"result": str(result)}
-
-            # Simple result value
-            return {"result": str(result)}
-
-        # Not a JSON-RPC response, convert to simple result
+        _LOGGER.debug("_extract_mcp_result: returning raw response type=%s", type(response).__name__)
+        
+        # Return the complete raw response as-is
+        if isinstance(response, dict):
+            return response
+        
+        # For non-dict responses, wrap minimally
         return {"result": str(response)}
 
     def _unwrap_json_text(self, text: str) -> str:
