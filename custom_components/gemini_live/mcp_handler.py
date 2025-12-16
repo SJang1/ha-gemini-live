@@ -20,11 +20,37 @@ from .const import (
     CONF_MCP_SERVER_COMMAND,
     CONF_MCP_SERVER_ARGS,
     CONF_MCP_SERVER_ENV,
+    CONF_MCP_SERVER_TOKEN,
+    CONF_MCP_SERVER_AUTH_HEADER,
+    CONF_MCP_SERVER_HEADERS,
 )
 
 from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _strip_surrounding_quotes(val: str) -> str:
+    """Remove surrounding single or double quotes from a string."""
+    if not isinstance(val, str):
+        return val
+    s = val.strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        return s[1:-1]
+    return s
+
+
+def _mask_token(token: str | None) -> str:
+    """Return a masked representation of a token for safe logging."""
+    if not token:
+        return "None"
+    try:
+        t = token.strip()
+    except Exception:
+        return "****"
+    if t.lower().startswith("bearer "):
+        return "Bearer ****"
+    return "****"
 
 
 @dataclass
@@ -45,6 +71,7 @@ class MCPServer:
     type: str  # "sse" or "stdio"
     url: str | None = None  # For SSE servers
     token: str | None = None  # For SSE server authentication
+    headers: dict[str, str] = field(default_factory=dict)
     command: str | None = None  # For stdio servers
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
@@ -52,6 +79,8 @@ class MCPServer:
     connected: bool = False
     _process: Any = None
     _reader_task: Any = None
+    session_id: str | None = None  # For HTTP/Streamable-HTTP servers
+    _http_sse_resp: Any = None
 
     async def _read_stderr(self) -> None:
         """Read and log stderr from the process to prevent buffer blocking."""
@@ -94,6 +123,7 @@ class MCPServerHandler:
         command: str | None = None,
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         """Add an MCP server."""
         self._servers[name] = MCPServer(
@@ -104,6 +134,7 @@ class MCPServerHandler:
             command=command,
             args=args or [],
             env=env or {},
+            headers=headers or {},
         )
 
     def add_server_from_config(self, config: dict[str, Any]) -> None:
@@ -117,6 +148,7 @@ class MCPServerHandler:
                 args_val = [s for s in args_val.split() if s]
 
         env_val = config.get(CONF_MCP_SERVER_ENV, {})
+        headers_val = config.get(CONF_MCP_SERVER_HEADERS, {})
         if isinstance(env_val, str):
             try:
                 env_val = json.loads(env_val)
@@ -127,27 +159,65 @@ class MCPServerHandler:
                     parsed = {}
                     for p in pairs:
                         k, v = p.split("=", 1)
-                        parsed[k.strip()] = v.strip()
+                        parsed[_strip_surrounding_quotes(k.strip())] = _strip_surrounding_quotes(v.strip())
                     env_val = parsed
                 except Exception:
                     _LOGGER.debug("Could not parse env string for server %s: %s", config.get(CONF_MCP_SERVER_NAME), env_val)
                     env_val = {}
 
-        _LOGGER.debug("Adding MCP server from config: %s (args=%s, env=%s)", config.get(CONF_MCP_SERVER_NAME), args_val, env_val)
+        # Parse headers similarly to env (accept JSON or comma-separated key=value or key: value)
+        if isinstance(headers_val, str):
+            try:
+                headers_val = json.loads(headers_val)
+            except Exception:
+                try:
+                    pairs = [p for p in headers_val.split(",") if p and ("=" in p or ":" in p)]
+                    parsed_h = {}
+                    for p in pairs:
+                        if ":" in p:
+                            k, v = p.split(":", 1)
+                        else:
+                            k, v = p.split("=", 1)
+                        parsed_h[_strip_surrounding_quotes(k.strip())] = _strip_surrounding_quotes(v.strip())
+                    headers_val = parsed_h
+                except Exception:
+                    _LOGGER.debug("Could not parse headers string for server %s: %s", config.get(CONF_MCP_SERVER_NAME), headers_val)
+                    headers_val = {}
+
+        _LOGGER.debug(
+            "Adding MCP server from config: %s (args=%s, env=%s, headers=%s)",
+            config.get(CONF_MCP_SERVER_NAME),
+            args_val,
+            env_val,
+            headers_val,
+        )
 
         self.add_server(
             name=config.get(CONF_MCP_SERVER_NAME, ""),
             server_type=config.get(CONF_MCP_SERVER_TYPE, "sse"),
             url=config.get(CONF_MCP_SERVER_URL),
+            token=config.get(CONF_MCP_SERVER_AUTH_HEADER, config.get(CONF_MCP_SERVER_TOKEN)),
             command=config.get(CONF_MCP_SERVER_COMMAND),
             args=args_val,
             env=env_val,
+            headers=headers_val,
         )
 
         # Log the resulting stored config for easy verification
         srv = self._servers.get(config.get(CONF_MCP_SERVER_NAME, ""))
         if srv:
-            _LOGGER.debug("Registered MCP server %s: command=%s args=%s env=%s", srv.name, srv.command, srv.args, srv.env)
+            # Don't log raw token/header values; log masked presence only
+            auth_in_headers = any(k.lower() == "authorization" for k in (srv.headers or {}))
+            masked = _mask_token(srv.token)
+            _LOGGER.debug(
+                "Registered MCP server %s: command=%s args=%s env=%s token=%s auth_in_headers=%s",
+                srv.name,
+                srv.command,
+                srv.args,
+                srv.env,
+                masked,
+                auth_in_headers,
+            )
 
     def remove_server(self, name: str) -> bool:
         """Remove an MCP server."""
@@ -168,6 +238,10 @@ class MCPServerHandler:
         """Get all SSE servers."""
         return [s for s in self._servers.values() if s.type == "sse"]
 
+    def get_http_servers(self) -> list[MCPServer]:
+        """Get all HTTP/streamable-HTTP servers."""
+        return [s for s in self._servers.values() if s.type == "http"]
+
     def get_stdio_servers(self) -> list[MCPServer]:
         """Get all stdio servers."""
         return [s for s in self._servers.values() if s.type == "stdio"]
@@ -178,12 +252,339 @@ class MCPServerHandler:
         if not server:
             return False
 
-        if server.type == "stdio":
+        _LOGGER.debug("Connecting to MCP server %s (type=%s) cmd=%s url=%s", server.name, server.type, server.command, server.url)
+
+        # If server explicitly requests stdio, prefer that.
+        if server.type == "stdio" or (server.command and server.type == ""):
+            _LOGGER.debug("Attempting stdio connect for %s", server.name)
+            ok = await self._connect_stdio_server(server)
+            if ok:
+                return True
+
+        # If declared as http/sse, or unknown type with a URL, attempt HTTP discovery
+        if server.type in ("http", "sse") or server.url:
+            _LOGGER.debug("Attempting HTTP discovery for %s", server.name)
+            ok = await self._connect_http_server(server)
+            if ok:
+                return True
+
+        # As a last resort, if command is specified try stdio again
+        if server.command:
+            _LOGGER.debug("Fallback: attempting stdio connect for %s (final attempt)", server.name)
             return await self._connect_stdio_server(server)
 
-        # SSE servers are HTTP-based and don't require a persistent connection here
-        # We consider them "connected" for the purpose of tool listing.
-        return True
+        _LOGGER.warning("No suitable transport found for server %s (type=%s, url=%s, command=%s)", server.name, server.type, server.url, server.command)
+        return False
+
+    async def _connect_http_server(self, server: MCPServer) -> bool:
+        """Discover tools from an HTTP/Streamable-HTTP MCP server.
+
+        This will POST to the server's /tools/list endpoint and populate
+        server.tools if the server responds with a tools list.
+        """
+        if not server.url:
+            return False
+
+        try:
+            # Prepare headers and token like SSE calls
+            request_headers = {**(server.headers or {})}
+            if server.token:
+                if not any(h.lower() == "authorization" for h in request_headers):
+                    auth_value = server.token
+                    if not auth_value.lower().startswith("bearer "):
+                        auth_value = f"Bearer {auth_value}"
+                    request_headers["Authorization"] = auth_value
+
+            # Log whether Authorization will be included (masked)
+            try:
+                auth_present = any(h.lower() == "authorization" for h in request_headers)
+                _LOGGER.debug(
+                    "HTTP init headers for %s: Authorization_present=%s token_mask=%s",
+                    server.name,
+                    auth_present,
+                    _mask_token(server.token),
+                )
+            except Exception:
+                pass
+
+            base = server.url.rstrip("/")
+
+            # Build Accept header per spec: support JSON and event-stream
+            request_headers.setdefault("Accept", "application/json, text/event-stream")
+
+            # 1) Try to POST an InitializeRequest to the MCP endpoint (new Streamable HTTP transport)
+            init_message = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "gemini-live-ha", "version": "1.0.0"},
+                },
+            }
+
+            headers_with_sid = {**request_headers}
+
+            try:
+                # Use raw post so we can keep the response open if it's an SSE stream.
+                resp = await self._session.post(f"{base}", json=init_message, headers=request_headers, timeout=10)
+                # If server accepts initialize, it may return JSON or an SSE stream.
+                if 400 <= resp.status < 500:
+                    # Old HTTP+SSE server or unsupported: fallback to opening GET to parse endpoint event
+                    _LOGGER.debug("Initialize POST returned %d: falling back to GET for %s", resp.status, server.name)
+                    init_failed = True
+                else:
+                    init_failed = False
+                    sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+                    data = None
+                    ctype = resp.headers.get("Content-Type", "")
+                    if "application/json" in ctype:
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            data = None
+                    # If JSON contains session id, use it
+                    if not sid and isinstance(data, dict):
+                        sid = data.get("sessionId") or data.get("mcpSessionId") or data.get("result", {}).get("sessionId")
+
+                    if sid:
+                        server.session_id = sid
+                        headers_with_sid["Mcp-Session-Id"] = server.session_id
+                        _LOGGER.debug("Got MCP session id for %s: %s", server.name, server.session_id)
+
+                    # If response is an SSE stream, keep the response open and start reader task.
+                    if "text/event-stream" in ctype:
+                        server._http_sse_resp = resp
+                        server._reader_task = asyncio.create_task(self._read_http_sse(server, resp))
+                    else:
+                        # Not a streaming response; release immediately to free connection.
+                        try:
+                            await resp.release()
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                _LOGGER.debug("Initialize POST failed for %s: %s", server.name, e)
+                init_failed = True
+
+            # If initialize POST failed with 4xx, attempt GET to detect old HTTP+SSE endpoint
+            if init_failed:
+                try:
+                    # per backwards compatibility, try GET and expect 'endpoint' event
+                    async with self._session.get(base, headers={"Accept": "text/event-stream"}, timeout=10) as get_resp:
+                        if get_resp.status == 200 and "text/event-stream" in get_resp.headers.get("Content-Type", ""):
+                            # parse the first SSE event and look for endpoint in data
+                            endpoint = None
+                            async for raw in get_resp.content:
+                                if not raw:
+                                    continue
+                                try:
+                                    text = raw.decode(errors="replace")
+                                except Exception:
+                                    text = str(raw)
+                                for line in text.splitlines():
+                                    if line.startswith("data:"):
+                                        payload = line[len("data:"):].strip()
+                                        try:
+                                            j = json.loads(payload)
+                                            # old transport: endpoint event contains POST endpoint
+                                            if isinstance(j, dict) and j.get("event") == "endpoint":
+                                                endpoint = j.get("data") or j.get("endpoint") or j.get("uri")
+                                                break
+                                        except Exception:
+                                            pass
+                                if endpoint:
+                                    break
+                            try:
+                                await get_resp.release()
+                            except Exception:
+                                pass
+                            if endpoint:
+                                # use endpoint as base for future POSTs
+                                _LOGGER.debug("Detected legacy HTTP+SSE endpoint for %s -> %s", server.name, endpoint)
+                                base = endpoint.rstrip("/")
+                                server.url = base
+                                headers_with_sid = {**request_headers}
+                            else:
+                                _LOGGER.debug("No endpoint event found in GET for %s", server.name)
+                except Exception as e:
+                    _LOGGER.debug("GET fallback failed for %s: %s", server.name, e)
+
+            # Send initialized notification (best-effort) to confirm initialization
+            try:
+                notif = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                await self._session.post(f"{base}", json=notif, headers=headers_with_sid, timeout=5)
+            except Exception:
+                pass
+
+            # Fetch tools list via POST {base}/tools/list using session header when available
+            tools = []
+            tools_url = f"{base.rstrip('/')}/tools/list"
+
+            async def _try_fetch_tools(url: str, method: str = "post"):
+                try:
+                    _LOGGER.debug("Attempting %s %s for tools (server=%s)", method.upper(), url, server.name)
+                    if method.lower() == "post":
+                        # Some MCP HTTP servers expect JSON-RPC payloads for tools/list
+                        payload = {}
+                        if url.rstrip("/").endswith("/tools/list") or url.rstrip("/") == base.rstrip("/"):
+                            payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+                        async with self._session.post(url, json=payload, headers=headers_with_sid, timeout=10) as resp:
+                            status = resp.status
+                            ctype = resp.headers.get("Content-Type", "")
+                            text = await resp.text()
+                            _LOGGER.debug("Tools fetch resp status=%s content-type=%s body=%s", status, ctype, text[:1000])
+                            if resp.status != 200:
+                                return None, status, text
+                            # If the server returned an SSE stream as a whole in the
+                            # response body, try to extract JSON from `data:` lines.
+                            if "text/event-stream" in ctype:
+                                try:
+                                    data_lines: list[str] = []
+                                    for line in text.splitlines():
+                                        if line.startswith("data:"):
+                                            data_lines.append(line[len("data:"):].strip())
+                                    if data_lines:
+                                        combined = "\n".join(data_lines)
+                                        try:
+                                            parsed = json.loads(combined)
+                                            return parsed, status, None
+                                        except Exception:
+                                            # Fallback: try to locate first `{` and parse
+                                            idx = combined.find("{")
+                                            if idx != -1:
+                                                try:
+                                                    parsed = json.loads(combined[idx:])
+                                                    return parsed, status, None
+                                                except Exception:
+                                                    pass
+                                except Exception:
+                                    pass
+                            try:
+                                return await resp.json(), status, None
+                            except Exception:
+                                return text, status, None
+                    else:
+                        # Some servers require GET requests to include Accept: text/event-stream
+                        get_headers = {**headers_with_sid, "Accept": "text/event-stream, application/json"}
+                        async with self._session.get(url, headers=get_headers, timeout=10) as resp:
+                            status = resp.status
+                            ctype = resp.headers.get("Content-Type", "")
+                            text = await resp.text()
+                            _LOGGER.debug("Tools fetch (GET) resp status=%s content-type=%s body=%s", status, ctype, text[:1000])
+                            if resp.status != 200:
+                                return None, status, text
+                            # If GET returned an SSE payload, try to extract JSON from data: lines
+                            if "text/event-stream" in ctype:
+                                try:
+                                    data_lines: list[str] = []
+                                    for line in text.splitlines():
+                                        if line.startswith("data:"):
+                                            data_lines.append(line[len("data:"):].strip())
+                                    if data_lines:
+                                        combined = "\n".join(data_lines)
+                                        try:
+                                            parsed = json.loads(combined)
+                                            return parsed, status, None
+                                        except Exception:
+                                            idx = combined.find("{")
+                                            if idx != -1:
+                                                try:
+                                                    parsed = json.loads(combined[idx:])
+                                                    return parsed, status, None
+                                                except Exception:
+                                                    pass
+                                except Exception:
+                                    pass
+                            try:
+                                return await resp.json(), status, None
+                            except Exception:
+                                return text, status, None
+                except Exception as e:
+                    _LOGGER.debug("Exception fetching tools from %s: %s", url, e)
+                    return None, None, str(e)
+
+            def _extract_tools_from_obj(data_obj):
+                # Accept several shapes: {tools: [...]}, {result: {tools: [...]}}, [ ... ]
+                if data_obj is None:
+                    return []
+                if isinstance(data_obj, list):
+                    return data_obj
+                if isinstance(data_obj, dict):
+                    if "tools" in data_obj and isinstance(data_obj["tools"], list):
+                        return data_obj["tools"]
+                    if "result" in data_obj and isinstance(data_obj["result"], dict) and "tools" in data_obj["result"]:
+                        return data_obj["result"]["tools"]
+                    # legacy nesting
+                    for key in ("data", "payload"):
+                        if key in data_obj and isinstance(data_obj[key], dict) and "tools" in data_obj[key]:
+                            return data_obj[key]["tools"]
+                return []
+
+            # Try several endpoints/fallbacks to discover tools
+            fetch_attempts = [
+                (tools_url, "post"),
+                (base, "post"),
+                (tools_url, "get"),
+                (base + "/tools/list", "get"),
+            ]
+
+            data = None
+            for url, method in fetch_attempts:
+                data_obj, status, error_text = await _try_fetch_tools(url, method)
+                if data_obj is None:
+                    # if we got an error body but 200 wasn't returned, continue
+                    continue
+                # extract tools
+                candidate = _extract_tools_from_obj(data_obj)
+                if candidate:
+                    tools = candidate
+                    break
+
+            if not tools:
+                _LOGGER.warning("Failed to discover tools for HTTP MCP server %s (tried %d endpoints)", server.name, len(fetch_attempts))
+                return False
+
+            server.tools = [
+                MCPTool(
+                    name=t.get("name", ""),
+                    description=t.get("description", ""),
+                    input_schema=t.get("inputSchema", {}),
+                    server_name=server.name,
+                )
+                for t in tools
+            ]
+
+            server.connected = True
+
+            # Attempt to open a listening GET SSE stream for server-initiated messages (optional)
+            try:
+                # Use Last-Event-ID support when we reconnect later; we don't have an ID now
+                get_headers = {"Accept": "text/event-stream"}
+                if server.session_id:
+                    get_headers["Mcp-Session-Id"] = server.session_id
+                resp = await self._session.get(base, headers=get_headers, timeout=10)
+                ctype = resp.headers.get("Content-Type", "")
+                if resp.status == 200 and "text/event-stream" in ctype:
+                    server._http_sse_resp = resp
+                    server._reader_task = asyncio.create_task(self._read_http_sse(server, resp))
+                    _LOGGER.info("Opened HTTP SSE listening stream for %s", server.name)
+                else:
+                    try:
+                        await resp.release()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            _LOGGER.info("Connected to HTTP MCP server %s with %d tools", server.name, len(server.tools))
+            return True
+
+        except Exception as e:
+            _LOGGER.exception("Error connecting to HTTP MCP server %s: %s", server.name, e)
+            return False
 
 
     async def connect_all_servers(self) -> dict[str, bool]:
@@ -208,6 +609,7 @@ class MCPServerHandler:
                 "command": server.command,
                 "args": server.args,
                 "env": server.env,
+                "headers": server.headers,
                 "connected": server.connected,
                 "tool_count": len(server.tools),
             })
@@ -415,21 +817,110 @@ class MCPServerHandler:
 
         return None
 
+    async def _read_http_sse(self, server: MCPServer, resp) -> None:
+        """Read SSE-style events from an open HTTP response.
+
+        This reads lines and emits debug logs; when an SSE event with JSON
+        data is received and contains tool results, it will log them.
+        """
+        try:
+            if not resp:
+                return
+
+            # Simple SSE parser: collect lines until a blank line, then parse fields
+            buffer_lines: list[str] = []
+            async for raw in resp.content:
+                if not raw:
+                    continue
+                try:
+                    text = raw.decode(errors="replace")
+                except Exception:
+                    text = str(raw)
+
+                # Split by newlines; accumulate until a blank line separates events
+                for line in text.splitlines():
+                    if line == "":
+                        # End of event
+                        if not buffer_lines:
+                            continue
+                        event_id = None
+                        event_type = None
+                        data_lines: list[str] = []
+                        for buf_line in buffer_lines:
+                            if buf_line.startswith("id:"):
+                                event_id = buf_line[len("id:"):].strip()
+                            elif buf_line.startswith("event:"):
+                                event_type = buf_line[len("event:"):].strip()
+                            elif buf_line.startswith("data:"):
+                                data_lines.append(buf_line[len("data:"):].strip())
+                            else:
+                                # ignore other SSE fields
+                                pass
+
+                        data_text = "\n".join(data_lines).strip()
+                        if data_text:
+                            _LOGGER.debug("HTTP SSE event [%s] event=%s id=%s data=%s", server.name, event_type or "", event_id or "", data_text)
+                            try:
+                                j = json.loads(data_text)
+                                # If server sends requests/notifications, we may need to handle them.
+                                if isinstance(j, dict) and j.get("method"):
+                                    # Server-initiated request or notification
+                                    _LOGGER.info("HTTP SSE server request/notification from %s: %s", server.name, j)
+                                elif isinstance(j, dict) and j.get("result"):
+                                    _LOGGER.info("HTTP SSE server response from %s: %s", server.name, j)
+                            except Exception:
+                                _LOGGER.debug("Non-JSON SSE data from %s: %s", server.name, data_text)
+
+                        buffer_lines = []
+                    else:
+                        buffer_lines.append(line)
+
+            # end async for
+
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOGGER.exception("Error reading HTTP SSE for %s", server.name)
+        finally:
+            try:
+                await resp.release()
+            except Exception:
+                pass
+
     async def disconnect_server(self, name: str) -> None:
         """Disconnect from a specific MCP server."""
         server = self._servers.get(name)
         if not server:
             return
 
+        # If this is a stdio server, terminate the process
         if server._process:
             server._process.terminate()
             await server._process.wait()
             server._process = None
-        
+
+        # If this is an HTTP/Streamable-HTTP server, optionally send DELETE to terminate session
+        if server.type == "http" and server.url and server.session_id:
+            try:
+                await self._session.delete(server.url, headers={"Mcp-Session-Id": server.session_id}, timeout=5)
+            except Exception:
+                pass
+
         try:
             if server._reader_task:
                 server._reader_task.cancel()
                 await server._reader_task
+        except Exception:
+            pass
+
+        # If we have an open aiohttp response for SSE, release it
+        try:
+            if getattr(server, "_http_sse_resp", None):
+                try:
+                    await server._http_sse_resp.release()
+                except Exception:
+                    pass
+                server._http_sse_resp = None
         except Exception:
             pass
 
@@ -482,14 +973,28 @@ class MCPServerHandler:
         """Call a tool on an MCP server."""
         server = self._servers.get(server_name)
         if not server or not server.connected:
+            _LOGGER.debug("Tool call attempted for disconnected server %s: %s(%s)", server_name, tool_name, arguments)
             return {"error": f"Server {server_name} not connected"}
+        _LOGGER.debug("Calling tool %s on server %s (type=%s) args=%s", tool_name, server_name, server.type, arguments)
 
+        # Route based on declared type; if unknown, try transports heuristically.
         if server.type == "sse":
             return await self._call_sse_tool(server, tool_name, arguments)
-        elif server.type == "stdio":
+        if server.type == "stdio":
+            return await self._call_stdio_tool(server, tool_name, arguments)
+        if server.type == "http":
+            return await self._call_http_tool(server, tool_name, arguments)
+
+        # Unknown type: prefer HTTP if URL available, otherwise stdio if command exists
+        if server.url:
+            _LOGGER.debug("Unknown server type; using HTTP call for %s", server.name)
+            return await self._call_http_tool(server, tool_name, arguments)
+        if server._process:
+            _LOGGER.debug("Unknown server type; using stdio call for %s", server.name)
             return await self._call_stdio_tool(server, tool_name, arguments)
 
-        return {"error": "Unknown server type"}
+        _LOGGER.error("Cannot call tool %s on server %s: no transport available", tool_name, server_name)
+        return {"error": "Unknown server type or no transport available"}
 
     async def _call_sse_tool(
         self,
@@ -499,15 +1004,39 @@ class MCPServerHandler:
     ) -> dict[str, Any]:
         """Call a tool on an SSE server."""
         try:
-            async with self._session.post(
-                f"{server.url}/tools/{tool_name}",
-                json=arguments,
-            ) as resp:
+            # Prepare headers: start from configured headers, then fall back to token if provided
+            request_headers = {**(server.headers or {})}
+            if server.token:
+                # Prefer explicit Authorization header in headers; otherwise use token
+                if not any(h.lower() == "authorization" for h in request_headers):
+                    auth_value = server.token
+                    if not auth_value.lower().startswith("bearer "):
+                        auth_value = f"Bearer {auth_value}"
+                    request_headers["Authorization"] = auth_value
+
+            # Log masked auth presence
+            try:
+                auth_present = any(h.lower() == "authorization" for h in request_headers)
+                _LOGGER.debug(
+                    "SSE tool call headers for %s: Authorization_present=%s token_mask=%s",
+                    server.name,
+                    auth_present,
+                    _mask_token(server.token),
+                )
+            except Exception:
+                pass
+
+            url = f"{server.url.rstrip('/')}/tools/{tool_name}"
+            _LOGGER.debug("SSE tool POST %s headers=%s body=%s", url, {k: ("****" if k.lower()=="authorization" else v) for k,v in request_headers.items()}, arguments)
+            async with self._session.post(url, json=arguments, headers=request_headers, timeout=30) as resp:
+                text = await resp.text()
+                _LOGGER.debug("SSE tool response status=%s body=%s", resp.status, text[:2000])
                 if resp.status == 200:
-                    return await resp.json()
-                else:
-                    text = await resp.text()
-                    return {"error": f"Tool call failed: {text}"}
+                    try:
+                        return await resp.json()
+                    except Exception:
+                        return {"result": text}
+                return {"error": f"Tool call failed: {text}", "status": resp.status}
         except Exception as e:
             return {"error": str(e)}
 
@@ -519,6 +1048,7 @@ class MCPServerHandler:
     ) -> dict[str, Any]:
         """Call a tool on a stdio server."""
         if not server._process:
+            _LOGGER.error("Stdio tool call failed: process for %s not running", server.name)
             return {"error": "Server process not running"}
 
         try:
@@ -531,6 +1061,7 @@ class MCPServerHandler:
                     "arguments": arguments,
                 },
             }
+            _LOGGER.debug("Stdio sending request to %s: %s", server.name, request)
             await self._send_stdio_message(server._process, request)
             response = await self._read_stdio_message(server._process, timeout=30.0)
 
@@ -539,12 +1070,98 @@ class MCPServerHandler:
                 # Extract text content
                 for item in content:
                     if item.get("type") == "text":
+                        _LOGGER.debug("Stdio tool %s result text: %s", tool_name, item.get("text", "")[:1000])
                         return {"result": item.get("text", "")}
                 return response["result"]
             elif response and "error" in response:
+                _LOGGER.debug("Stdio tool %s returned error: %s", tool_name, response["error"])
                 return {"error": response["error"]}
 
             return {"error": "No response from tool"}
+
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _call_http_tool(
+        self,
+        server: MCPServer,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call a tool on an HTTP/Streamable-HTTP server."""
+        if not server.url:
+            _LOGGER.error("HTTP tool call failed: server %s has no URL configured", server.name)
+            return {"error": "Server URL not configured"}
+
+        try:
+            headers = {**(server.headers or {})}
+            # Include Accept as required
+            headers.setdefault("Accept", "application/json, text/event-stream")
+            if server.session_id:
+                headers["Mcp-Session-Id"] = server.session_id
+            if server.token and not any(h.lower() == "authorization" for h in headers):
+                auth_value = server.token
+                if not auth_value.lower().startswith("bearer "):
+                    auth_value = f"Bearer {auth_value}"
+                headers["Authorization"] = auth_value
+
+            # Log masked auth presence for HTTP tool call
+            try:
+                auth_present = any(h.lower() == "authorization" for h in headers)
+                _LOGGER.debug(
+                    "HTTP tool call headers for %s: Authorization_present=%s token_mask=%s",
+                    server.name,
+                    auth_present,
+                    _mask_token(server.token),
+                )
+            except Exception:
+                pass
+
+            url = server.url.rstrip("/") + f"/tools/{tool_name}"
+
+            _LOGGER.debug("HTTP tool POST %s headers=%s body=%s", url, {k: ("****" if k.lower()=="authorization" else v) for k,v in headers.items()}, arguments)
+            async with self._session.post(url, json=arguments, headers=headers, timeout=30) as resp:
+                ctype = resp.headers.get("Content-Type", "")
+                text_body = await resp.text()
+                _LOGGER.debug("HTTP tool response status=%s content-type=%s body=%s", resp.status, ctype, text_body[:2000])
+                if resp.status == 200:
+                    # Try JSON first
+                    if "application/json" in ctype:
+                        try:
+                            return await resp.json()
+                        except Exception:
+                            return {"result": text_body}
+                    if "text/event-stream" in ctype:
+                        # parse SSE inline (simple parser)
+                        buffer_lines: list[str] = []
+                        async for raw in resp.content:
+                            if not raw:
+                                continue
+                            try:
+                                text = raw.decode(errors="replace")
+                            except Exception:
+                                text = str(raw)
+                            for line in text.splitlines():
+                                if line == "":
+                                    data_lines = [ln[len("data:"):].strip() for ln in buffer_lines if ln.startswith("data:")]
+                                    data_text = "\n".join(data_lines).strip()
+                                    buffer_lines = []
+                                    if not data_text:
+                                        continue
+                                    try:
+                                        j = json.loads(data_text)
+                                        if isinstance(j, dict) and ("result" in j or "error" in j):
+                                            return j
+                                    except Exception:
+                                        pass
+                                else:
+                                    buffer_lines.append(line)
+                        return {"error": "No response in SSE stream"}
+                    return {"result": text_body}
+                elif resp.status == 202:
+                    return {"status": "accepted"}
+                else:
+                    return {"error": f"Tool call failed: {text_body}", "status": resp.status}
 
         except Exception as e:
             return {"error": str(e)}

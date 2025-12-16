@@ -31,6 +31,9 @@ from .const import (
     DOMAIN,
     MCP_SERVER_TYPE_SSE,
     MCP_SERVER_TYPE_STDIO,
+    MCP_SERVER_TYPE_HTTP,
+    CONF_ENABLE_HA_TOOLS,
+    CONF_MCP_SERVER_AUTH_HEADER,
 )
 from .conversation import (
     GeminiLiveConversationAgent,
@@ -69,9 +72,10 @@ SEND_AUDIO_SCHEMA = vol.Schema({
 
 ADD_MCP_SERVER_SCHEMA = vol.Schema({
     vol.Required("name"): cv.string,
-    vol.Required("server_type"): vol.In([MCP_SERVER_TYPE_SSE, MCP_SERVER_TYPE_STDIO]),
+    # Allow callers to provide arbitrary server_type strings (don't hardcode types).
+    vol.Required("server_type"): cv.string,
     vol.Optional("url"): cv.url,
-    vol.Optional("token"): cv.string,
+    vol.Optional(CONF_MCP_SERVER_AUTH_HEADER): cv.string,
     vol.Optional("command"): cv.string,
     vol.Optional("args"): vol.All(cv.ensure_list, [cv.string]),
     vol.Optional("env"): dict,
@@ -107,36 +111,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         mcp_handler.add_server_from_config(server_config)
 
-    # Connect to stdio MCP servers and get their tools
-    stdio_servers = mcp_handler.get_stdio_servers()
-    if stdio_servers:
-        _LOGGER.info("Connecting to %d stdio MCP servers...", len(stdio_servers))
-        for server in stdio_servers:
-            try:
-                connected = await mcp_handler.connect_server(server.name)
-                if connected:
-                    _LOGGER.info(
-                        "Connected to stdio MCP server %s, found %d tools",
-                        server.name,
-                        len(server.tools),
-                    )
-                else:
-                    _LOGGER.warning("Failed to connect to stdio MCP server %s", server.name)
-            except Exception as e:
-                _LOGGER.error("Error connecting to stdio MCP server %s: %s", server.name, e)
+    # Attempt to connect to all configured MCP servers (stdio, http, sse)
+    # so we can discover their available tools on startup.
+    try:
+        _LOGGER.info("Connecting to configured MCP servers...")
+        results = await mcp_handler.connect_all_servers()
+        for name, ok in results.items():
+            srv = mcp_handler.get_server(name)
+            tool_count = len(srv.tools) if srv else 0
+            if ok:
+                _LOGGER.info("Connected to MCP server %s (type=%s) with %d tools", name, srv.type if srv else "?", tool_count)
+            else:
+                _LOGGER.warning("Failed to connect to MCP server %s (type=%s)", name, srv.type if srv else "?")
+    except Exception as e:
+        _LOGGER.exception("Error connecting to MCP servers: %s", e)
 
-    # Get built-in Home Assistant tools
+    # Get built-in Home Assistant tools (opt-in via config)
     from .mcp_handler import HomeAssistantMCPTools
     ha_tools = HomeAssistantMCPTools(hass)
-    builtin_tools = ha_tools.get_builtin_tools()
-    
-    # Add stdio MCP server tools as function tools
-    stdio_tools = mcp_handler.get_tools_as_functions()
-    all_tools = builtin_tools + stdio_tools
+    include_ha_tools = config.get(CONF_ENABLE_HA_TOOLS, True)
+    if include_ha_tools:
+        builtin_tools = ha_tools.get_builtin_tools()
+    else:
+        builtin_tools = []
+
+    # Add all MCP server tools (discovered above) as function tools
+    mcp_tools = mcp_handler.get_tools_as_functions()
+    all_tools = builtin_tools + mcp_tools
     _LOGGER.info(
-        "Total tools: %d builtin + %d stdio MCP = %d",
+        "Total tools: %d builtin (included=%s) + %d MCP = %d",
         len(builtin_tools),
-        len(stdio_tools),
+        include_ha_tools,
+        len(mcp_tools),
         len(all_tools),
     )
 
@@ -226,7 +232,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         name = call.data["name"]
         server_type = call.data.get("server_type", MCP_SERVER_TYPE_SSE)
         url = call.data.get("url", "")
-        token = call.data.get("token")
+        authorization = call.data.get(CONF_MCP_SERVER_AUTH_HEADER)
         command = call.data.get("command", "")
         args = call.data.get("args", [])
         env = call.data.get("env", {})
@@ -240,7 +246,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                     name=name,
                     server_type=server_type,
                     url=url,
-                    token=token,
+                    token=authorization,
                     command=command,
                     args=args,
                     env=env,

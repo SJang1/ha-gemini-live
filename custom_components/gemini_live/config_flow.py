@@ -26,9 +26,12 @@ from .const import (
     CONF_MCP_SERVER_ENV,
     CONF_MCP_SERVER_NAME,
     CONF_MCP_SERVER_TOKEN,
+    CONF_MCP_SERVER_AUTH_HEADER,
+    CONF_MCP_SERVER_HEADERS,
     CONF_MCP_SERVER_TYPE,
     CONF_MCP_SERVER_URL,
     CONF_MCP_SERVERS,
+    CONF_MCP_SERVER_TIMEOUT,
     CONF_MODEL,
     CONF_TEMPERATURE,
     CONF_VOICE,
@@ -40,6 +43,7 @@ from .const import (
     DOMAIN,
     MCP_SERVER_TYPE_SSE,
     MCP_SERVER_TYPE_STDIO,
+    MCP_SERVER_TYPE_HTTP,
     MODELS,
     VOICES,
 )
@@ -171,6 +175,8 @@ class GeminiLiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_mcp_add_sse()
             elif action == "add_stdio":
                 return await self.async_step_mcp_add_stdio()
+            elif action == "add_http":
+                return await self.async_step_mcp_add_http()
             elif action == "finish":
                 return self._create_entry()
 
@@ -192,6 +198,7 @@ class GeminiLiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         selector.SelectSelectorConfig(
                             options=[
                                 {"value": "add_sse", "label": "Add SSE Server"},
+                                {"value": "add_http", "label": "Add HTTP/Streamable-HTTP Server"},
                                 {"value": "add_stdio", "label": "Add Stdio Server"},
                                 {"value": "finish", "label": "Finish Setup"},
                             ],
@@ -251,7 +258,8 @@ class GeminiLiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_MCP_SERVER_NAME: user_input.get(CONF_MCP_SERVER_NAME, f"SSE Server {len(self._mcp_servers) + 1}"),
                     CONF_MCP_SERVER_TYPE: MCP_SERVER_TYPE_SSE,
                     CONF_MCP_SERVER_URL: url,
-                    CONF_MCP_SERVER_TOKEN: user_input.get(CONF_MCP_SERVER_TOKEN, ""),
+                    CONF_MCP_SERVER_AUTH_HEADER: user_input.get(CONF_MCP_SERVER_AUTH_HEADER, ""),
+                    CONF_MCP_SERVER_HEADERS: user_input.get(CONF_MCP_SERVER_HEADERS, ""),
                     CONF_MCP_SERVER_ENABLED: True,
                 })
                 return await self.async_step_mcp_menu()
@@ -264,7 +272,47 @@ class GeminiLiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_MCP_SERVER_NAME): str,
                     vol.Required(CONF_MCP_SERVER_URL): str,
-                    vol.Optional(CONF_MCP_SERVER_TOKEN): str,
+                    vol.Optional(CONF_MCP_SERVER_AUTH_HEADER): str,
+                    vol.Optional(CONF_MCP_SERVER_HEADERS, default=""): str,
+                    vol.Optional(CONF_MCP_SERVER_TIMEOUT, default=30): int,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_mcp_add_http(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Add an HTTP/Streamable-HTTP MCP server."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            url = user_input.get(CONF_MCP_SERVER_URL, "")
+            if url and not url.startswith(("http://", "https://")):
+                errors[CONF_MCP_SERVER_URL] = "invalid_url"
+            elif url:
+                self._mcp_servers.append({
+                    CONF_MCP_SERVER_NAME: user_input.get(CONF_MCP_SERVER_NAME, f"HTTP Server {len(self._mcp_servers) + 1}"),
+                    CONF_MCP_SERVER_TYPE: MCP_SERVER_TYPE_HTTP,
+                    CONF_MCP_SERVER_URL: url,
+                    CONF_MCP_SERVER_AUTH_HEADER: user_input.get(CONF_MCP_SERVER_AUTH_HEADER, ""),
+                    CONF_MCP_SERVER_HEADERS: user_input.get(CONF_MCP_SERVER_HEADERS, ""),
+                    CONF_MCP_SERVER_TIMEOUT: int(user_input.get(CONF_MCP_SERVER_TIMEOUT, 30) or 30),
+                    CONF_MCP_SERVER_ENABLED: True,
+                })
+                return await self.async_step_mcp_menu()
+            else:
+                return await self.async_step_mcp_menu()
+
+        return self.async_show_form(
+            step_id="mcp_add_http",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_MCP_SERVER_NAME): str,
+                    vol.Required(CONF_MCP_SERVER_URL): str,
+                    vol.Optional(CONF_MCP_SERVER_AUTH_HEADER, default=""): str,
+                    vol.Optional(CONF_MCP_SERVER_HEADERS, default=""): str,
+                    vol.Optional(CONF_MCP_SERVER_TIMEOUT, default=30): int,
                 }
             ),
             errors=errors,
@@ -459,6 +507,8 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
                 return await self.async_step_mcp_add_sse()
             elif action == "add_stdio":
                 return await self.async_step_mcp_add_stdio()
+            elif action == "add_http":
+                return await self.async_step_mcp_add_http()
             elif action == "manage":
                 return await self.async_step_mcp_manage()
             elif action == "finish":
@@ -467,6 +517,7 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
         # Build options based on current servers
         options = [
             {"value": "add_sse", "label": "Add SSE Server"},
+            {"value": "add_http", "label": "Add HTTP/Streamable-HTTP Server"},
             {"value": "add_stdio", "label": "Add Stdio Server"},
         ]
 
@@ -518,7 +569,8 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
                     CONF_MCP_SERVER_NAME: user_input.get(CONF_MCP_SERVER_NAME, f"SSE Server {len(self._mcp_servers) + 1}"),
                     CONF_MCP_SERVER_TYPE: MCP_SERVER_TYPE_SSE,
                     CONF_MCP_SERVER_URL: url,
-                    CONF_MCP_SERVER_TOKEN: user_input.get(CONF_MCP_SERVER_TOKEN, ""),
+                    CONF_MCP_SERVER_AUTH_HEADER: user_input.get(CONF_MCP_SERVER_AUTH_HEADER, ""),
+                    CONF_MCP_SERVER_HEADERS: user_input.get(CONF_MCP_SERVER_HEADERS, ""),
                     CONF_MCP_SERVER_ENABLED: True,
                 })
                 return await self.async_step_mcp_menu()
@@ -531,7 +583,46 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
                 {
                     vol.Required(CONF_MCP_SERVER_NAME): str,
                     vol.Required(CONF_MCP_SERVER_URL): str,
-                    vol.Optional(CONF_MCP_SERVER_TOKEN): str,
+                    vol.Optional(CONF_MCP_SERVER_AUTH_HEADER): str,
+                    vol.Optional(CONF_MCP_SERVER_HEADERS, default=""): str,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_mcp_add_http(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Add an HTTP MCP server (options flow)."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            url = user_input.get(CONF_MCP_SERVER_URL, "")
+            if url and not url.startswith(("http://", "https://")):
+                errors[CONF_MCP_SERVER_URL] = "invalid_url"
+            elif url:
+                self._mcp_servers.append({
+                    CONF_MCP_SERVER_NAME: user_input.get(CONF_MCP_SERVER_NAME, f"HTTP Server {len(self._mcp_servers) + 1}"),
+                    CONF_MCP_SERVER_TYPE: MCP_SERVER_TYPE_HTTP,
+                    CONF_MCP_SERVER_URL: url,
+                    CONF_MCP_SERVER_AUTH_HEADER: user_input.get(CONF_MCP_SERVER_AUTH_HEADER, ""),
+                    CONF_MCP_SERVER_HEADERS: user_input.get(CONF_MCP_SERVER_HEADERS, ""),
+                    CONF_MCP_SERVER_TIMEOUT: int(user_input.get(CONF_MCP_SERVER_TIMEOUT, 30) or 30),
+                    CONF_MCP_SERVER_ENABLED: True,
+                })
+                return await self.async_step_mcp_menu()
+            else:
+                return await self.async_step_mcp_menu()
+
+        return self.async_show_form(
+            step_id="mcp_add_http",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_MCP_SERVER_NAME): str,
+                    vol.Required(CONF_MCP_SERVER_URL): str,
+                    vol.Optional(CONF_MCP_SERVER_AUTH_HEADER, default=""): str,
+                    vol.Optional(CONF_MCP_SERVER_HEADERS, default=""): str,
+                    vol.Optional(CONF_MCP_SERVER_TIMEOUT, default=30): int,
                 }
             ),
             errors=errors,
@@ -657,18 +748,24 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
         server_type = server.get(CONF_MCP_SERVER_TYPE, MCP_SERVER_TYPE_SSE)
 
         if user_input is not None:
-            if server_type == MCP_SERVER_TYPE_SSE:
+            if server_type in (MCP_SERVER_TYPE_SSE, MCP_SERVER_TYPE_HTTP):
                 url = user_input.get(CONF_MCP_SERVER_URL, "")
                 if url and not url.startswith(("http://", "https://")):
                     errors[CONF_MCP_SERVER_URL] = "invalid_url"
                 else:
-                    self._mcp_servers[self._editing_server_index] = {
+                    new_entry = {
                         CONF_MCP_SERVER_NAME: user_input.get(CONF_MCP_SERVER_NAME, server.get(CONF_MCP_SERVER_NAME)),
-                        CONF_MCP_SERVER_TYPE: MCP_SERVER_TYPE_SSE,
+                        CONF_MCP_SERVER_TYPE: server_type,
                         CONF_MCP_SERVER_URL: url,
-                        CONF_MCP_SERVER_TOKEN: user_input.get(CONF_MCP_SERVER_TOKEN, ""),
+                        CONF_MCP_SERVER_AUTH_HEADER: user_input.get(CONF_MCP_SERVER_AUTH_HEADER, ""),
+                        CONF_MCP_SERVER_HEADERS: user_input.get(CONF_MCP_SERVER_HEADERS, server.get(CONF_MCP_SERVER_HEADERS, "")),
                         CONF_MCP_SERVER_ENABLED: server.get(CONF_MCP_SERVER_ENABLED, True),
                     }
+                    # Include timeout for HTTP servers
+                    if server_type == MCP_SERVER_TYPE_HTTP:
+                        new_entry[CONF_MCP_SERVER_TIMEOUT] = int(user_input.get(CONF_MCP_SERVER_TIMEOUT, server.get(CONF_MCP_SERVER_TIMEOUT, 30)) or 30)
+
+                    self._mcp_servers[self._editing_server_index] = new_entry
                     self._editing_server_index = None
                     return await self.async_step_mcp_manage()
             else:
@@ -696,16 +793,23 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
                 self._editing_server_index = None
                 return await self.async_step_mcp_manage()
 
-        if server_type == MCP_SERVER_TYPE_SSE:
+        if server_type in (MCP_SERVER_TYPE_SSE, MCP_SERVER_TYPE_HTTP):
+            # Build fields; include timeout for HTTP servers
+            fields = {
+                vol.Required(CONF_MCP_SERVER_NAME, default=server.get(CONF_MCP_SERVER_NAME, "")): str,
+                vol.Required(CONF_MCP_SERVER_URL, default=server.get(CONF_MCP_SERVER_URL, "")): str,
+                vol.Optional(
+                    CONF_MCP_SERVER_AUTH_HEADER,
+                    default=server.get(CONF_MCP_SERVER_AUTH_HEADER, server.get(CONF_MCP_SERVER_TOKEN, "")),
+                ): str,
+                vol.Optional(CONF_MCP_SERVER_HEADERS, default=server.get(CONF_MCP_SERVER_HEADERS, "")): str,
+            }
+            if server_type == MCP_SERVER_TYPE_HTTP:
+                fields[vol.Optional(CONF_MCP_SERVER_TIMEOUT, default=server.get(CONF_MCP_SERVER_TIMEOUT, 30))] = int
+
             return self.async_show_form(
                 step_id="mcp_edit",
-                data_schema=vol.Schema(
-                    {
-                        vol.Required(CONF_MCP_SERVER_NAME, default=server.get(CONF_MCP_SERVER_NAME, "")): str,
-                        vol.Required(CONF_MCP_SERVER_URL, default=server.get(CONF_MCP_SERVER_URL, "")): str,
-                        vol.Optional(CONF_MCP_SERVER_TOKEN, default=server.get(CONF_MCP_SERVER_TOKEN, "")): str,
-                    }
-                ),
+                data_schema=vol.Schema(fields),
                 errors=errors,
             )
         else:

@@ -27,9 +27,11 @@ from .const import (
     DEFAULT_MODEL,
     DEFAULT_TEMPERATURE,
     DEFAULT_VOICE,
+    CONF_ENABLE_HA_TOOLS,
 )
 from .mcp_handler import HomeAssistantMCPTools, MCPServerHandler
 from .live_client import GeminiLiveClient, LiveResponse, SessionConfig
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,13 +72,19 @@ class GeminiLiveConversationAgent(conversation.AbstractConversationAgent):
 
         session = async_get_clientsession(self.hass)
 
-        # Initialize MCP handler
-        self._mcp_handler = MCPServerHandler(session)
-
-        # Add configured MCP servers
+        # Reuse MCP handler created during integration setup when available.
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {})
+        existing_handler: MCPServerHandler | None = entry_data.get("mcp_handler")
+        # Always load configured MCP servers for session config
         mcp_servers = config.get(CONF_MCP_SERVERS, [])
-        for server_config in mcp_servers:
-            self._mcp_handler.add_server_from_config(server_config)
+
+        if existing_handler is not None:
+            self._mcp_handler = existing_handler
+        else:
+            # Fallback: create a handler and add configured servers
+            self._mcp_handler = MCPServerHandler(session)
+            for server_config in mcp_servers:
+                self._mcp_handler.add_server_from_config(server_config)
 
         # Connect to stdio MCP servers to get their tools
         stdio_servers = self._mcp_handler.get_stdio_servers()
@@ -91,18 +99,40 @@ class GeminiLiveConversationAgent(conversation.AbstractConversationAgent):
             except Exception as e:
                 _LOGGER.error("Error connecting to stdio MCP server %s: %s", server.name, e)
 
+        # Also attempt to connect to HTTP/Streamable-HTTP MCP servers so their
+        # tools are available to the model as functions. HTTP servers may
+        # expose tools via POST /tools/list and/or stream events; ensure we
+        # attempt to discover tools here as well.
+        http_servers = self._mcp_handler.get_http_servers()
+        for server in http_servers:
+            try:
+                await self._mcp_handler.connect_server(server.name)
+                _LOGGER.info(
+                    "Connected to HTTP MCP server %s with %d tools",
+                    server.name,
+                    len(server.tools),
+                )
+            except Exception as e:
+                _LOGGER.error("Error connecting to HTTP MCP server %s: %s", server.name, e)
+
         # Initialize Home Assistant tools
         self._ha_tools = HomeAssistantMCPTools(self.hass)
         
-        # Build tools list: HA builtin + stdio MCP tools
-        builtin_tools = self._ha_tools.get_builtin_tools()
-        stdio_tools = self._mcp_handler.get_tools_as_functions()
-        all_tools = builtin_tools + stdio_tools
-        
+        # Build tools list: HA builtin + MCP server tools (HA builtins are opt-in)
+        include_ha_tools = config.get(CONF_ENABLE_HA_TOOLS, True)
+        if include_ha_tools:
+            builtin_tools = self._ha_tools.get_builtin_tools()
+        else:
+            builtin_tools = []
+
+        mcp_tools = self._mcp_handler.get_tools_as_functions()
+        all_tools = builtin_tools + mcp_tools
+
         _LOGGER.info(
-            "Agent tools: %d builtin + %d stdio MCP = %d total",
+            "Agent tools: %d builtin (included=%s) + %d MCP = %d total",
             len(builtin_tools),
-            len(stdio_tools),
+            include_ha_tools,
+            len(mcp_tools),
             len(all_tools),
         )
 

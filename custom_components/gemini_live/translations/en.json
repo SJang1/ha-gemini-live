@@ -49,11 +49,15 @@
         "description": "Add a Server-Sent Events MCP server.",
         "data": {
           "name": "Server Name",
-          "url": "Server URL"
+          "url": "Server URL",
+          "authorization": "Authorization Header (optional)",
+          "headers": "Headers (optional)"
         },
         "data_description": {
           "name": "A unique name for this server",
-          "url": "The URL of the SSE MCP server"
+          "url": "The URL of the SSE MCP server",
+          "authorization": "An optional Authorization header value (e.g., 'Bearer <token>'). You can also add an Authorization header via the Headers field.",
+          "headers": "Optional headers as JSON or comma-separated pairs (e.g., Authorization: Bearer x, X-Api-Key=abc)"
         }
       },
       "mcp_add_stdio": {
@@ -114,7 +118,9 @@
         "title": "Add SSE MCP Server",
         "data": {
           "name": "Server Name",
-          "url": "Server URL"
+          "url": "Server URL",
+          "authorization": "Authorization Header (optional)",
+          "headers": "Headers (optional)"
         }
       },
       "mcp_add_stdio": {

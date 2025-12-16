@@ -49,11 +49,15 @@
         "description": "Add a Server-Sent Events MCP server.",
         "data": {
           "name": "Server Name",
-          "url": "Server URL"
+          "url": "Server URL",
+          "authorization": "Authorization Header",
+          "headers": "Additional Headers"
         },
         "data_description": {
           "name": "A unique name for this server",
-          "url": "The URL of the SSE MCP server"
+          "url": "The URL of the SSE MCP server",
+          "authorization": "Optional Authorization header value (e.g., 'Bearer <token>'). You can also provide an Authorization header via the Headers field.",
+          "headers": "Optional extra headers as JSON or comma-separated key=value pairs (e.g., Authorization: Bearer <token>)"
         }
       },
       "mcp_add_stdio": {
@@ -69,22 +73,40 @@
           "command": "The command to run (e.g., npx, uvx)",
           "args": "Command arguments (one per line)"
         }
+      },
+      "mcp_add_http": {
+        "title": "Add HTTP/Streamable-HTTP MCP Server",
+        "description": "Add a Streamable-HTTP MCP server (supports JSON and SSE responses).",
+        "data": {
+          "name": "Server Name",
+          "url": "Server URL",
+          "authorization": "Authorization Header",
+          "headers": "Additional Headers",
+          "timeout": "Request Timeout (s)"
+        },
+        "data_description": {
+          "name": "A unique name for this server",
+          "url": "The base URL of the HTTP/Streamable-HTTP MCP server",
+          "authorization": "Optional Authorization header value (e.g., 'Bearer <token>'). You can also provide an Authorization header via the Headers field.",
+          "headers": "Optional extra headers as JSON or comma-separated key=value pairs (e.g., Authorization: Bearer <token>)",
+          "timeout": "Per-request timeout in seconds"
+        }
+      },
+      "personalization_confirm": {
+        "title": "Personalization - Confirm",
+        "description": "Enabling personalization may send additional conversation data to the external service to improve and personalize responses. Only enable if you accept the potential data handling implications.",
+        "data": {
+          "confirm_personalization": "I understand and accept the privacy implications"
+        }
+      },
+      "error": {
+        "invalid_api_key": "Invalid API key",
+        "cannot_connect": "Cannot connect to Gemini API",
+        "unknown": "Unknown error occurred"
+      },
+      "abort": {
+        "already_configured": "This integration is already configured"
       }
-    },
-    "personalization_confirm": {
-      "title": "Personalization - Confirm",
-      "description": "Enabling personalization may send additional conversation data to the external service to improve and personalize responses. Only enable if you accept the potential data handling implications.",
-      "data": {
-        "confirm_personalization": "I understand and accept the privacy implications"
-      }
-    },
-    "error": {
-      "invalid_api_key": "Invalid API key",
-      "cannot_connect": "Cannot connect to Gemini API",
-      "unknown": "Unknown error occurred"
-    },
-    "abort": {
-      "already_configured": "This integration is already configured"
     }
   },
   "options": {
@@ -114,7 +136,9 @@
         "title": "Add SSE MCP Server",
         "data": {
           "name": "Server Name",
-          "url": "Server URL"
+          "url": "Server URL",
+          "authorization": "Authorization Header",
+          "headers": "Additional Headers"
         }
       },
       "mcp_add_stdio": {

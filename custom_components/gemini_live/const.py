@@ -12,6 +12,8 @@ CONF_MCP_SERVERS: Final = "mcp_servers"
 CONF_MCP_SERVER_URL: Final = "url"
 CONF_MCP_SERVER_NAME: Final = "name"
 CONF_MCP_SERVER_TOKEN: Final = "token"
+CONF_MCP_SERVER_AUTH_HEADER: Final = "authorization"
+CONF_MCP_SERVER_HEADERS: Final = "headers"
 CONF_MCP_SERVER_TYPE: Final = "server_type"
 CONF_MCP_SERVER_COMMAND: Final = "command"
 CONF_MCP_SERVER_ARGS: Final = "args"
@@ -22,15 +24,18 @@ CONF_TEMPERATURE: Final = "temperature"
 CONF_ENABLE_AFFECTIVE_DIALOG: Final = "enable_affective_dialog"
 CONF_ENABLE_PROACTIVE_AUDIO: Final = "enable_proactive_audio"
 CONF_ENABLE_GOOGLE_SEARCH: Final = "enable_google_search"
+CONF_ENABLE_HA_TOOLS: Final = "enable_ha_tools"
 CONF_ENABLE_PERSONALIZATION: Final = "enable_personalization"
 CONF_MEDIA_RESOLUTION: Final = "media_resolution"
 
 # MCP Server Types
 MCP_SERVER_TYPE_SSE: Final = "sse"
 MCP_SERVER_TYPE_STDIO: Final = "stdio"
+MCP_SERVER_TYPE_HTTP: Final = "http"
 MCP_SERVER_TYPES: Final = [
     MCP_SERVER_TYPE_SSE,
     MCP_SERVER_TYPE_STDIO,
+    MCP_SERVER_TYPE_HTTP,
 ]
 
 # Default values
