@@ -56,6 +56,15 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     # Get versioned URL for cache busting
     card_version = _get_card_version()
     card_url_versioned = f"{CARD_URL}?v={card_version}"
+    
+    # Remove any previously registered URL to prevent duplicates on reload/version change
+    old_url = hass.data.get(f"{DOMAIN}_card_url_versioned")
+    if old_url and old_url != card_url_versioned:
+        try:
+            remove_extra_js_url(hass, old_url)
+        except Exception:
+            pass  # Ignore if already removed
+    
     # Add the card to the frontend (versioned URL for cache busting)
     try:
         add_extra_js_url(hass, card_url_versioned)
@@ -131,15 +140,23 @@ async def async_add_lovelace_resource(hass: HomeAssistant) -> None:
             _LOGGER.debug("Lovelace resources not available (YAML mode?)")
             return
 
-        # Get versioned URL
-        card_version = _get_card_version()
-        card_url_versioned = f"{CARD_URL}?v={card_version}"
+        # Use the versioned URL stored during registration for consistency
+        card_url_versioned = hass.data.get(f"{DOMAIN}_card_url_versioned")
+        if not card_url_versioned:
+            # Fallback if not stored yet (shouldn't happen in normal flow)
+            card_version = _get_card_version()
+            card_url_versioned = f"{CARD_URL}?v={card_version}"
 
-        # Check if already exists (check both versioned and unversioned)
+        # Check if already exists with the SAME version (check both versioned and unversioned)
         for resource in resources:
             resource_url = resource.get("url", "")
             if resource_url.startswith(CARD_URL):
-                _LOGGER.debug("Lovelace resource already exists")
+                if resource_url == card_url_versioned:
+                    _LOGGER.debug("Lovelace resource already exists with current version")
+                    return
+                # Resource exists but with old version - update it
+                _LOGGER.debug("Lovelace resource exists with old version, updating")
+                await _update_lovelace_resource(hass, resource.get("id"), card_url_versioned)
                 return
 
         # Add the resource with version
@@ -181,13 +198,16 @@ async def _get_lovelace_resources(hass: HomeAssistant) -> list[dict[str, Any]] |
         resources_collection = getattr(lovelace_data, "resources", None)
         if resources_collection is None:
             return None
-            
+
+        # Ensure the collection is loaded before accessing items
+        if hasattr(resources_collection, "loaded") and not resources_collection.loaded:
+            if hasattr(resources_collection, "async_load"):
+                await resources_collection.async_load()
+                resources_collection.loaded = True
+
         if hasattr(resources_collection, "async_items"):
-            items = resources_collection.async_items()
-            # Check if it's a coroutine (awaitable) or a regular result
-            if hasattr(items, "__await__"):
-                return await items
-            return list(items) if items else []
+            # async_items() is synchronous in HA despite the name
+            return list(resources_collection.async_items() or [])
         elif hasattr(resources_collection, "data"):
             return list(resources_collection.data.values())
 
@@ -206,16 +226,33 @@ async def _add_lovelace_resource(hass: HomeAssistant, url: str, resource_type: s
 
     resources_collection = getattr(lovelace_data, "resources", None)
     if resources_collection and hasattr(resources_collection, "async_create_item"):
+        # CRITICAL: Ensure the resources collection is loaded before creating items.
+        # If we call async_create_item before the collection is loaded, the collection's
+        # internal data dict will be empty, and when it saves, it will OVERWRITE all
+        # existing resources with just our new item, deleting all other custom cards.
+        if hasattr(resources_collection, "loaded") and not resources_collection.loaded:
+            if hasattr(resources_collection, "async_load"):
+                await resources_collection.async_load()
+                resources_collection.loaded = True
+        
+        # Double-check: If we think it's loaded but data is empty, something went wrong.
+        # In this case, bail out to avoid potentially overwriting existing resources.
+        if hasattr(resources_collection, "data") and not resources_collection.data:
+            # Check if there really are no resources by trying to get items
+            existing_items = resources_collection.async_items() if hasattr(resources_collection, "async_items") else None
+            if existing_items is None or len(list(existing_items)) == 0:
+                # Could be empty OR could be a load failure - check if storage exists
+                _LOGGER.debug("Resources collection appears empty, proceeding cautiously")
+        
         # Different HA versions/implementations accept slightly different
-        # payload shapes when creating a resource. Try a few payloads and
-        # log failures so we can diagnose problems like
-        # "extra keys not allowed @ data['type']".
+        # payload shapes when creating a resource. Try payloads in order of
+        # likelihood to succeed (res_type is the correct field name in modern HA).
         payloads = [
-            {"url": url, "type": resource_type},
-            {"url": url},
-            {"url": url, "resource_type": resource_type},
             {"url": url, "res_type": resource_type},
             {"url": url, "res_type": "module"},
+            {"url": url, "type": resource_type},
+            {"url": url, "resource_type": resource_type},
+            {"url": url},
         ]
 
         for payload in payloads:
@@ -233,7 +270,36 @@ async def _add_lovelace_resource(hass: HomeAssistant, url: str, resource_type: s
         _LOGGER.warning("All attempts to add Lovelace resource failed for URL: %s", url)
 
 
-async def _remove_lovelace_resource(hass: HomeAssistant, resource_id: str) -> None:
+async def _update_lovelace_resource(hass: HomeAssistant, resource_id: str | None, url: str) -> None:
+    """Update an existing Lovelace resource URL."""
+    if not resource_id:
+        return
+
+    lovelace_data = hass.data.get("lovelace")
+    if not lovelace_data:
+        return
+
+    resources_collection = getattr(lovelace_data, "resources", None)
+    if resources_collection and hasattr(resources_collection, "async_update_item"):
+        # Ensure the collection is loaded before updating items to avoid data corruption
+        if hasattr(resources_collection, "loaded") and not resources_collection.loaded:
+            if hasattr(resources_collection, "async_load"):
+                await resources_collection.async_load()
+                resources_collection.loaded = True
+        
+        # Verify we can find the item before updating (ensures data is loaded)
+        if hasattr(resources_collection, "data") and resource_id not in resources_collection.data:
+            _LOGGER.debug("Resource %s not found in collection, skipping update", resource_id)
+            return
+        
+        try:
+            await resources_collection.async_update_item(resource_id, {"url": url})
+            _LOGGER.info("Updated Gemini Live card resource to version: %s", url)
+        except Exception as exc:
+            _LOGGER.debug("Failed to update Lovelace resource: %s", exc)
+
+
+async def _remove_lovelace_resource(hass: HomeAssistant, resource_id: str | None) -> None:
     """Remove a resource from Lovelace."""
     if not resource_id:
         return
@@ -244,4 +310,18 @@ async def _remove_lovelace_resource(hass: HomeAssistant, resource_id: str) -> No
 
     resources_collection = getattr(lovelace_data, "resources", None)
     if resources_collection and hasattr(resources_collection, "async_delete_item"):
-        await resources_collection.async_delete_item(resource_id)
+        # Ensure the collection is loaded before deleting items to avoid data corruption
+        if hasattr(resources_collection, "loaded") and not resources_collection.loaded:
+            if hasattr(resources_collection, "async_load"):
+                await resources_collection.async_load()
+                resources_collection.loaded = True
+        
+        # Verify we can find the item before deleting (ensures data is loaded)
+        if hasattr(resources_collection, "data") and resource_id not in resources_collection.data:
+            _LOGGER.debug("Resource %s not found in collection, skipping delete", resource_id)
+            return
+        
+        try:
+            await resources_collection.async_delete_item(resource_id)
+        except Exception as exc:
+            _LOGGER.debug("Failed to delete Lovelace resource %s: %s", resource_id, exc)

@@ -12,6 +12,9 @@ import asyncio
 import json
 import base64
 import logging
+import re
+import unicodedata
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, cast
@@ -135,6 +138,11 @@ class GeminiLiveClient:
         self._function_behaviors: dict[str, str] = {}
         # Preserve original/raw declarations (name -> original dict)
         self._raw_function_declarations: dict[str, dict[str, Any]] = {}
+        # Counter for function responses sent in this session (for debugging)
+        self._function_response_count: int = 0
+        # Track token usage for context limit monitoring
+        self._last_prompt_token_count: int = 0
+        self._token_warning_threshold: int = 50000  # Warn when approaching limit
 
         # Current response tracking
         self._current_response: LiveResponse | None = None
@@ -145,6 +153,13 @@ class GeminiLiveClient:
         # Session resumption tracking
         self._session_resumption_handle: str | None = None
         self._session_resumable: bool = False
+
+        # Function call processing state - block audio/input during function calls
+        self._processing_function_call: bool = False
+        # Timestamp of last turn complete - used to add brief delay before new input
+        self._last_turn_complete_time: float = 0.0
+        # Minimum delay (seconds) after turn complete before allowing new input
+        self._turn_complete_delay: float = 0.05  # 50ms delay
 
         # GoAway tracking
         self._go_away_time_left: int | None = None
@@ -257,11 +272,38 @@ class GeminiLiveClient:
                         return {"name": str(f)}
                     name = f.get("name") or f.get("id") or ""
                     desc = f.get("description") or (f.get("annotations") or {}).get("title") or ""
-                    desc += str(f)
                     params = f.get("parameters") or f.get("inputSchema") or f.get("input_schema") or {}
+                    
+                    # Add a CONCISE parameter summary to help the model understand how to call the function.
+                    # This replaces the old approach of appending str(f) which caused 65k+ token bloat.
+                    try:
+                        props = params.get("properties", {}) if isinstance(params, dict) else {}
+                        required = params.get("required", []) if isinstance(params, dict) else []
+                        if props and isinstance(props, dict):
+                            # Build concise summary: "Parameters: param1 (type, required), param2 (type)"
+                            param_parts = []
+                            for pname, pdef in props.items():
+                                ptype = pdef.get("type", "any") if isinstance(pdef, dict) else "any"
+                                pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
+                                is_req = pname in required
+                                # Keep param description short (first 50 chars)
+                                if pdesc and len(pdesc) > 50:
+                                    pdesc = pdesc[:47] + "..."
+                                if is_req:
+                                    param_parts.append(f"{pname}: {ptype} (required){' - ' + pdesc if pdesc else ''}")
+                                else:
+                                    param_parts.append(f"{pname}: {ptype}{' - ' + pdesc if pdesc else ''}")
+                            if param_parts:
+                                # Limit to first 10 params to avoid bloat
+                                if len(param_parts) > 10:
+                                    param_parts = param_parts[:10] + [f"... and {len(param_parts) - 10} more"]
+                                desc = desc.rstrip() + " | Params: " + "; ".join(param_parts)
+                    except Exception:
+                        pass
+                    
                     # Ensure parameters is a dict with properties we can augment
 
-                    _LOGGER.debug("Sanitizing function dict for %s: name=%s desc=%s", server_name, name, desc)
+                    _LOGGER.debug("Sanitizing function dict for %s: name=%s desc_len=%d", server_name, name, len(desc))
                     
                     try:
                         if not isinstance(params, dict):
@@ -451,6 +493,17 @@ class GeminiLiveClient:
                 except Exception:
                     _LOGGER.debug("Failed to add simple function defs; adding as single Tool dict", exc_info=True)
                     tools_list.append({"function_declarations": simple_funcs})
+
+        # Log total tools size for debugging token usage
+        try:
+            tools_json = json.dumps(tools_list, ensure_ascii=False, default=str)
+            tools_size = len(tools_json)
+            # Rough token estimate: ~4 chars per token
+            estimated_tokens = tools_size // 4
+            _LOGGER.debug("_build_tools: total tools size=%d bytes, estimated_tokens=%d, num_tool_entries=%d", 
+                        tools_size, estimated_tokens, len(tools_list))
+        except Exception:
+            pass
 
         return tools_list
 
@@ -648,6 +701,12 @@ class GeminiLiveClient:
 
             self._connected = True
 
+            # Install frame logger immediately to capture all frames for debugging
+            try:
+                await self._install_ws_frame_logger(duration=600)  # 10 minutes
+            except Exception as fl_err:
+                _LOGGER.debug("Failed to install early frame logger: %s", fl_err)
+
             # Set initial connection count for the first successful connection
             self._connection_count = 1
 
@@ -723,6 +782,25 @@ class GeminiLiveClient:
             except Exception:
                 pass
 
+            # If underlying socket returned an invalid-frame (1007), treat as fatal
+            if "1007" in err_str or "invalid frame" in err_str.lower() or "invalid frame payload" in err_str.lower():
+                _LOGGER.warning("connect: invalid-frame error detected during connection")
+                # Dump recent ws frames if available to aid diagnosis
+                try:
+                    ws = None
+                    if self._session:
+                        ws = getattr(self._session, "_ws", None) or getattr(self._session, "ws", None) or getattr(self._session, "_transport", None)
+                    if ws and getattr(ws, "_frame_logger_history", None):
+                        _LOGGER.error("connect: recent ws frames (most recent last):")
+                        for idx, entry in enumerate(list(getattr(ws, "_frame_logger_history", []))):
+                            try:
+                                direction, opcode, length, preview_b64, full_b64 = entry
+                                prefix = full_b64
+                                _LOGGER.error("  [%02d] %s opcode=%s bytes=%d preview_b64=%s full_b64_prefix=%s", idx, direction, opcode, length, preview_b64, prefix)
+                            except Exception:
+                                _LOGGER.error("  [%02d] frame: (uninspectable)", idx)
+                except Exception:
+                    pass
             return False
 
     async def disconnect(self) -> None:
@@ -758,6 +836,9 @@ class GeminiLiveClient:
 
         self._session = None
         self._session_context = None
+        # Reset function call processing state
+        self._processing_function_call = False
+        self._last_turn_complete_time = 0.0
         _LOGGER.info("Disconnected from Gemini Live API (all clients disconnected)")
 
     async def _receive_loop(self) -> None:
@@ -785,7 +866,7 @@ class GeminiLiveClient:
                     # Log response structure for debugging
                     _LOGGER.debug("Response received: %s", type(response))
                     if hasattr(response, "server_content") and response.server_content:
-                        _LOGGER.debug("server_content attrs: %s", dir(response.server_content))
+                        _LOGGER.debug("server_content attrs: came in maybe",)
                     # Handle server content
                     if hasattr(response, "server_content") and response.server_content:
                         server_content = response.server_content
@@ -803,7 +884,7 @@ class GeminiLiveClient:
                         # Handle model turn (audio/text output)
                         if hasattr(server_content, "model_turn") and server_content.model_turn:
                             model_turn = server_content.model_turn
-                            _LOGGER.debug("Model turn received: %s", type(model_turn))
+                            _LOGGER.debug("Model turn received: maybe")
                             if hasattr(model_turn, "parts") and model_turn.parts:
                                 _LOGGER.debug("Model turn has %d parts", len(model_turn.parts))
                                 for part in model_turn.parts:
@@ -874,6 +955,12 @@ class GeminiLiveClient:
 
                         # Check for turn complete
                         if hasattr(server_content, "turn_complete") and server_content.turn_complete:
+                            # Record turn complete time for input timing
+                            import time
+                            self._last_turn_complete_time = time.monotonic()
+                            # Clear function call processing flag since turn is complete
+                            self._processing_function_call = False
+                            
                             # Turn complete
                             if self._current_response:
                                 self._current_response.status = "completed"
@@ -894,6 +981,24 @@ class GeminiLiveClient:
                             await self._emit(EVENT_TURN_COMPLETE, {
                                 "transcript": self._current_response.audio_transcript if self._current_response else ""
                             })
+
+                    # Parse usage metadata to monitor token count (comes on response, not server_content)
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        usage = response.usage_metadata
+                        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                        if prompt_tokens > 0:
+                            self._last_prompt_token_count = prompt_tokens
+                            # Log warning if approaching context limit
+                            if prompt_tokens > self._token_warning_threshold:
+                                _LOGGER.warning(
+                                    "TOKEN WARNING: prompt_tokens=%d exceeds warning threshold %d. "
+                                    "Context compression trigger is %d. Connection may be unstable.",
+                                    prompt_tokens,
+                                    self._token_warning_threshold,
+                                    self._session_config.trigger_tokens
+                                )
+                            else:
+                                _LOGGER.debug("Token usage: prompt_tokens=%d", prompt_tokens)
 
                         # Check for generation complete (new session management feature)
                         if hasattr(server_content, "generation_complete") and server_content.generation_complete:
@@ -1066,16 +1171,45 @@ class GeminiLiveClient:
             except Exception as e:
                 error_str = str(e)
                 # Treat common close codes as clean/fatal closures and stop the loop
-                # 1000 = normal closure, 1001 = going away, 1008 = policy violation, 1011 = internal error
-                close_codes = ("1000", "1001", "1008", "1011")
+                # 1000 = normal closure, 1001 = going away, 1007 = invalid frame payload, 1008 = policy violation, 1011 = internal error
+                close_codes = ("1000", "1001", "1007", "1008", "1011")
                 if any(code in error_str for code in close_codes) or "closed" in error_str.lower():
                     # Provide specialized logging for known codes
-                    if "1011" in error_str:
+                    if "1007" in error_str or "invalid frame" in error_str.lower():
+                        _LOGGER.error("WebSocket closed due to invalid frame payload (1007): %s", error_str)
+                    elif "1011" in error_str:
                         _LOGGER.info("WebSocket connection terminated (deadline expired)")
                     elif "1008" in error_str or "policy violation" in error_str.lower():
                         _LOGGER.error("Policy error in receive loop; closing session: %s", error_str)
                     else:
                         _LOGGER.info("WebSocket connection closed: %s", error_str)
+
+                    # If we have the frame logger history available, dump the most
+                    # recent frames to aid diagnosing invalid-frame (1007) errors.
+                    try:
+                        ws = None
+                        if self._session:
+                            # Try multiple attribute names where SDK stores ws
+                            ws = getattr(self._session, "_ws", None) or getattr(self._session, "ws", None) or getattr(self._session, "_transport", None)
+                        if ws and getattr(ws, "_frame_logger_history", None):
+                            _LOGGER.error("WebSocket frame logger captured recent frames (most recent last):")
+                            try:
+                                for idx, entry in enumerate(list(getattr(ws, "_frame_logger_history", []))):
+                                    try:
+                                        direction, opcode, length, preview_b64, full_b64 = entry
+                                        # Decode the preview to show text content
+                                        try:
+                                            preview_bytes = base64.b64decode(preview_b64)
+                                            preview_text = preview_bytes.decode("utf-8", errors="replace")
+                                        except Exception:
+                                            preview_text = f"(decode failed) b64={preview_b64}"
+                                        _LOGGER.error("  [%02d] %s opcode=%s bytes=%d text=%s", idx, direction, opcode, length, preview_text)
+                                    except Exception:
+                                        _LOGGER.error("  [%02d] frame: (uninspectable)", idx)
+                            except Exception:
+                                _LOGGER.debug("Failed iterating _frame_logger_history", exc_info=True)
+                    except Exception:
+                        pass
 
                     # Include traceback/debug info for closure events
                     try:
@@ -1122,6 +1256,10 @@ class GeminiLiveClient:
 
                 _LOGGER.info("Function call: %s with args: %s", name, args)
 
+                # Set flag to block audio/input during function call processing
+                # This prevents 1007 errors from sending input while Gemini processes function calls
+                self._processing_function_call = True
+
                 # Determine if this function was declared as non-blocking
                 non_blocking = False
                 try:
@@ -1136,7 +1274,7 @@ class GeminiLiveClient:
                     "non_blocking": non_blocking,
                 }
                 _LOGGER.debug(
-                    "Stored pending function call: id=%s name=%s args=%s non_blocking=%s",
+                    "Stored pending function call: id=%s name=%s args=%s non_blocking=%s (audio blocked)",
                     call_id,
                     name,
                     args,
@@ -1158,6 +1296,114 @@ class GeminiLiveClient:
 
         except Exception as e:
             _LOGGER.error("Error handling tool call: %s", e)
+
+    def _extract_mcp_result(self, response: Any) -> Any:
+        """Extract the actual result content from an MCP JSON-RPC response.
+
+        MCP servers return responses in JSON-RPC format like:
+        {"jsonrpc": "2.0", "id": 123, "result": {"content": [...], "isError": False}}
+
+        The text field often contains a JSON string like:
+        {"success": true, "result": "Live Context: ..."}
+
+        Gemini's Live API expects a simple result object like {"result": "text"}.
+        This method extracts the meaningful content and flattens nested JSON.
+        """
+        if not isinstance(response, dict):
+            return {"result": str(response)}
+
+        # Check if this is a JSON-RPC response (has jsonrpc key)
+        if "jsonrpc" in response:
+            # Extract the result field
+            result = response.get("result")
+            if result is None:
+                # Check for error
+                error = response.get("error")
+                if error:
+                    error_str = str(error) if not isinstance(error, str) else error
+                    return {"error": error_str}
+                return {"result": "No result returned"}
+
+            # If result has MCP content format, extract text content
+            if isinstance(result, dict):
+                content = result.get("content")
+                _LOGGER.debug("_extract_mcp_result: result is dict, content type=%s", 
+                             type(content).__name__ if content else "None")
+                if isinstance(content, list):
+                    # Extract text from content items
+                    texts = []
+                    for i, item in enumerate(content):
+                        if isinstance(item, dict):
+                            text_value = item.get("text", "")
+                            _LOGGER.debug("_extract_mcp_result: item[%d] text_value type=%s len=%d first100=%s", 
+                                         i, type(text_value).__name__, len(text_value) if text_value else 0,
+                                         repr(text_value[:100]) if text_value else "empty")
+                            if text_value:
+                                # The text might be a JSON string - try to parse and extract
+                                extracted_text = self._unwrap_json_text(text_value)
+                                _LOGGER.debug("_extract_mcp_result: extracted_text len=%d first100=%s",
+                                             len(extracted_text), repr(extracted_text))
+                                texts.append(extracted_text)
+                    if texts:
+                        # Join all text content with newlines
+                        joined = "\n".join(texts)
+                        _LOGGER.debug("_extract_mcp_result: returning joined result len=%d", len(joined))
+                        return {"result": joined}
+
+                # Return the result as a string representation
+                return {"result": str(result)}
+
+            # Simple result value
+            return {"result": str(result)}
+
+        # Not a JSON-RPC response, convert to simple result
+        return {"result": str(response)}
+
+    def _unwrap_json_text(self, text: str) -> str:
+        """Unwrap text that might be a JSON string containing the actual content.
+        
+        MCP servers often return text like:
+        '{"success": true, "result": "Live Context: ..."}'
+        
+        This extracts just the text content ("Live Context: ...") for Gemini.
+        """
+        if not isinstance(text, str):
+            _LOGGER.debug("_unwrap_json_text: input not str, type=%s", type(text).__name__)
+            return str(text)
+        
+        _LOGGER.debug("_unwrap_json_text: input len=%d, chars: %s", len(text), text)
+        
+        # Try to parse as JSON
+        try:
+            parsed = json.loads(text)
+            _LOGGER.debug("_unwrap_json_text: parsed JSON type=%s keys=%s", 
+                         type(parsed).__name__, 
+                         list(parsed.keys()) if isinstance(parsed, dict) else "N/A")
+            
+            if isinstance(parsed, dict):
+                # Look for common content keys
+                for key in ("result", "text", "content", "message", "data"):
+                    if key in parsed:
+                        value = parsed[key]
+                        _LOGGER.debug("_unwrap_json_text: found key '%s', value type=%s, len=%s", 
+                                     key, type(value).__name__, 
+                                     len(value) if isinstance(value, str) else "N/A")
+                        if isinstance(value, str):
+                            return value
+                        elif isinstance(value, (dict, list)):
+                            # If it's still structured, convert to readable string
+                            return json.dumps(value, ensure_ascii=False, indent=2)
+                # If no known key, just stringify the whole thing nicely
+                _LOGGER.debug("_unwrap_json_text: no known key found, stringifying dict")
+                return json.dumps(parsed, ensure_ascii=False, indent=2)
+            elif isinstance(parsed, list):
+                return json.dumps(parsed, ensure_ascii=False, indent=2)
+            else:
+                return str(parsed)
+        except (json.JSONDecodeError, TypeError) as e:
+            # Not JSON, return as-is
+            _LOGGER.debug("_unwrap_json_text: failed to parse as JSON: %s", e)
+            return text
 
     def _sanitize_for_json(self, obj: Any, _depth: int = 0) -> Any:
         """Recursively convert an object to a JSON-serializable form.
@@ -1213,6 +1459,199 @@ class GeminiLiveClient:
         except Exception:
             return repr(obj)
 
+    def _find_function_declaration(self, name: str) -> dict | None:
+        """Find a function declaration by name from the configured tools.
+
+        Returns the raw declaration dict when available, otherwise None.
+        This is a best-effort lookup used for lightweight validation only.
+        """
+        try:
+            tools = getattr(self._session_config, "tools", None) or []
+            for t in tools:
+                # Support both dict-shaped tool entries and SDK Tool objects
+                fdecls = None
+                if isinstance(t, dict):
+                    fdecls = t.get("function_declarations") or t.get("functions") or []
+                else:
+                    fdecls = getattr(t, "function_declarations", None) or getattr(t, "functions", None) or []
+
+                for fd in (fdecls or []):
+                    try:
+                        fname = fd.get("name") if isinstance(fd, dict) else getattr(fd, "name", None)
+                        if fname == name:
+                            return fd if isinstance(fd, dict) else fd.__dict__
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return None
+
+    def _validate_response_shape(self, fdecl: dict | None, response: Any) -> tuple[bool, str]:
+        """Lightweight validator: check simple type expectations from declaration.
+
+        Returns (is_valid, reason). This intentionally avoids full JSON Schema
+        validation (keeps dependency-free). It only checks common type hints
+        such as top-level `type` == 'object' vs primitive/string expectations.
+        """
+        if not fdecl:
+            return True, "no_declaration"
+
+        try:
+            # Try common locations for output/return schema keys used by MCP
+            schema = None
+            for key in ("returns", "return", "response", "output_schema", "output", "result", "outputSchema", "parameters"):
+                if isinstance(fdecl, dict) and key in fdecl and isinstance(fdecl.get(key), dict):
+                    schema = fdecl.get(key)
+                    break
+
+            # If no explicit schema found, accept by default
+            if not schema:
+                return True, "no_schema"
+
+            # Look for top-level type hint
+            stype = schema.get("type") if isinstance(schema, dict) else None
+            if not stype:
+                return True, "no_type"
+
+            stype_norm = str(stype).lower()
+            # Map simple expectations
+            if stype_norm == "object":
+                if isinstance(response, dict):
+                    return True, "ok"
+                return False, "expected_object"
+            if stype_norm == "array" or stype_norm == "list":
+                if isinstance(response, (list, tuple)):
+                    return True, "ok"
+                return False, "expected_array"
+            if stype_norm in ("string", "str"):
+                if isinstance(response, str):
+                    return True, "ok"
+                return False, "expected_string"
+            # For numeric/boolean be permissive
+            if stype_norm in ("number", "integer", "int", "float"):
+                if isinstance(response, (int, float)):
+                    return True, "ok"
+                return False, "expected_number"
+            if stype_norm in ("boolean", "bool"):
+                if isinstance(response, bool):
+                    return True, "ok"
+                return False, "expected_boolean"
+
+            return True, "unknown_type"
+        except Exception as e:
+            return True, f"validation_error:{e}"
+
+    async def _install_ws_frame_logger(self, duration: int = 10) -> None:
+        """Install a short-lived wrapper around the underlying websocket's
+        send/recv to log raw frame bytes (opcode + preview) for debugging.
+
+        This is best-effort and will no-op if the underlying ws object isn't
+        discoverable. It restores original methods after `duration` seconds.
+        """
+        try:
+            if not self._session:
+                _LOGGER.debug("_install_ws_frame_logger: no active session")
+                return
+
+            # Try common internal attribute names used by SDK to hold the ws
+            ws = getattr(self._session, "_ws", None) or getattr(self._session, "ws", None) or getattr(self._session, "_transport", None)
+            if not ws:
+                _LOGGER.debug("_install_ws_frame_logger: underlying websocket object not found on session")
+                return
+
+            # Avoid double-install
+            if getattr(ws, "_frame_logger_installed", False):
+                _LOGGER.debug("_install_ws_frame_logger: already installed")
+                return
+
+            orig_send = getattr(ws, "send", None)
+            orig_recv = getattr(ws, "recv", None)
+            if not callable(orig_send) or not callable(orig_recv):
+                _LOGGER.debug("_install_ws_frame_logger: ws.send or ws.recv not callable")
+                return
+
+            async def send_wrapper(data, *a, **kw):
+                try:
+                    if isinstance(data, str):
+                        b = data.encode("utf-8", errors="replace")
+                        opcode = "text"
+                    else:
+                        b = bytes(data)
+                        opcode = "binary"
+                    # Capture preview and store a history of recent frames for post-mortem
+                    preview_b64 = base64.b64encode(b[:512]).decode("ascii", errors="ignore")
+                    _LOGGER.debug("WS_FRAME_OUT opcode=%s bytes=%d preview_b64=%s", opcode, len(b), preview_b64)
+                    try:
+                        # Keep a short rolling history on the ws instance for later inspection
+                        hist = getattr(ws, "_frame_logger_history", None)
+                        if hist is None:
+                            hist = deque(maxlen=64)
+                            setattr(ws, "_frame_logger_history", hist)
+                        # Store both a short preview and the full base64 payload
+                        full_b64 = base64.b64encode(b).decode("ascii", errors="ignore")
+                        hist.append(("OUT", opcode, len(b), preview_b64, full_b64))
+                    except Exception:
+                        pass
+                except Exception:
+                    _LOGGER.debug("WS_FRAME_OUT: failed to inspect outgoing frame")
+                return await orig_send(data, *a, **kw)
+
+            async def recv_wrapper(*a, **kw):
+                raw = await orig_recv(*a, **kw)
+                try:
+                    if isinstance(raw, (bytes, bytearray)):
+                        b = bytes(raw)
+                        opcode = "binary"
+                    else:
+                        b = str(raw).encode("utf-8", errors="replace")
+                        opcode = "text"
+                    preview_b64 = base64.b64encode(b[:512]).decode("ascii", errors="ignore")
+                    _LOGGER.debug("WS_FRAME_IN opcode=%s bytes=%d preview_b64=%s", opcode, len(b), preview_b64)
+                    try:
+                        hist = getattr(ws, "_frame_logger_history", None)
+                        if hist is None:
+                            hist = deque(maxlen=64)
+                            setattr(ws, "_frame_logger_history", hist)
+                        full_b64 = base64.b64encode(b).decode("ascii", errors="ignore")
+                        hist.append(("IN", opcode, len(b), preview_b64, full_b64))
+                    except Exception:
+                        pass
+                except Exception:
+                    _LOGGER.debug("WS_FRAME_IN: failed to inspect incoming frame")
+                return raw
+
+            # Patch methods on the ws object instance
+            try:
+                ws.send = send_wrapper
+                ws.recv = recv_wrapper
+                setattr(ws, "_frame_logger_installed", True)
+                _LOGGER.info("_install_ws_frame_logger: installed frame logger for %ds", duration)
+            except Exception as e:
+                _LOGGER.debug("_install_ws_frame_logger: failed to patch ws methods: %s", e, exc_info=True)
+                return
+
+            async def _uninstall_later():
+                try:
+                    await asyncio.sleep(duration)
+                    try:
+                        ws.send = orig_send
+                        ws.recv = orig_recv
+                        setattr(ws, "_frame_logger_installed", False)
+                        _LOGGER.info("_install_ws_frame_logger: uninstalled frame logger")
+                    except Exception as e:
+                        _LOGGER.debug("_install_ws_frame_logger: failed to restore ws methods: %s", e, exc_info=True)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    _LOGGER.debug("_install_ws_frame_logger: uninstall task exception", exc_info=True)
+
+            try:
+                asyncio.create_task(_uninstall_later())
+            except Exception:
+                _LOGGER.debug("_install_ws_frame_logger: failed to create uninstall task", exc_info=True)
+        except Exception as e:
+            _LOGGER.debug("_install_ws_frame_logger: unexpected error: %s", e, exc_info=True)
+
     def _preview_tools(self, tools: list[Any]) -> dict[str, Any]:
         """Create a compact preview summary for tools to keep logs small.
 
@@ -1262,6 +1701,45 @@ class GeminiLiveClient:
 
         return {"tools": previews}
 
+    def _sanitize_strings_in_obj(self, obj: Any, _depth: int = 0) -> Any:
+        """Recursively sanitize strings in an object.
+
+        - Normalize Unicode to NFC
+        - Remove problematic control characters (except common whitespace)
+        - Limit recursion depth to avoid pathological structures
+        """
+        if _depth > 12:
+            return obj
+
+        # Strings: normalize and strip control chars except \n, \r, \t
+        if isinstance(obj, str):
+            try:
+                s = unicodedata.normalize("NFC", obj)
+            except Exception:
+                s = obj
+            try:
+                s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+            except Exception:
+                pass
+            return s
+
+        # Mapping
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                try:
+                    key = k if isinstance(k, str) else str(k)
+                    out[key] = self._sanitize_strings_in_obj(v, _depth + 1)
+                except Exception:
+                    out[str(k)] = str(v)
+            return out
+
+        # Sequence
+        if isinstance(obj, (list, tuple)):
+            return [self._sanitize_strings_in_obj(v, _depth + 1) for v in obj]
+
+        return obj
+
     async def send_text(self, text: str, turn_complete: bool = True) -> LiveResponse:
         """Send text message to the API and wait for response.
         
@@ -1271,6 +1749,16 @@ class GeminiLiveClient:
             raise RuntimeError("Not connected to Gemini Live API")
 
         import uuid
+        import time as time_module
+        
+        # Add brief delay after turn complete to avoid sending during transitional state
+        # This helps prevent 1007 errors when sending immediately after model response
+        if self._last_turn_complete_time > 0:
+            elapsed = time_module.monotonic() - self._last_turn_complete_time
+            if elapsed < self._turn_complete_delay:
+                delay_needed = self._turn_complete_delay - elapsed
+                _LOGGER.debug("send_text: waiting %.3fs after turn complete", delay_needed)
+                await asyncio.sleep(delay_needed)
         
         # Create response future
         self._current_response = LiveResponse(
@@ -1282,8 +1770,22 @@ class GeminiLiveClient:
 
         # Send text using send_client_content (official API method)
         send_client_content = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_client_content"))
+        turns_payload = {"role": "user", "parts": [{"text": text}]}
+        # Install frame logger to capture what's actually being sent
+        try:
+            await self._install_ws_frame_logger(duration=5)
+        except Exception:
+            pass
+        
+        try:
+            payload_dump = json.dumps(turns_payload, ensure_ascii=False)
+            payload_bytes = len(payload_dump.encode("utf-8", errors="replace"))
+        except Exception:
+            payload_dump = None
+            payload_bytes = 0
+        _LOGGER.debug("send_text: sending turns bytes=%d sample=%s", payload_bytes, payload_dump[:512] if payload_dump else "<dump-failed>")
         await send_client_content(
-            turns={"role": "user", "parts": [{"text": text}]},
+            turns=turns_payload,
             turn_complete=turn_complete
         )
 
@@ -1306,6 +1808,13 @@ class GeminiLiveClient:
         """
         if not self._connected or not self._session:
             return
+        
+        # Block audio during function call processing to avoid 1007 errors
+        # The Gemini API rejects realtime input while processing function calls
+        if self._processing_function_call:
+            _LOGGER.debug("send_audio: skipping - function call in progress")
+            return
+        
         # Validate type
         if not isinstance(audio_data, (bytes, bytearray, memoryview)):
             _LOGGER.error("send_audio: audio_data must be bytes-like, got %s", type(audio_data))
@@ -1321,17 +1830,11 @@ class GeminiLiveClient:
         if len(audio_data) % 2 != 0:
             _LOGGER.warning("send_audio: audio payload length is odd (%d) — likely not 16-bit PCM", len(audio_data))
 
-        # Prepare blob and base64 representation
+        # Prepare Blob for fallback
         blob = types.Blob(
             data=bytes(audio_data),
             mime_type=f"audio/pcm;rate={sample_rate}",
         )
-
-        # Prepare base64 dict payload (safer for JSON/text frames)
-        try:
-            audio_b64 = base64.b64encode(bytes(audio_data)).decode("utf-8")
-        except Exception:
-            audio_b64 = None
 
         # Debug: log a short preview of the payload to help diagnose invalid-frame issues.
         try:
@@ -1351,20 +1854,16 @@ class GeminiLiveClient:
             # Cast the session method to an awaitable callable so static checkers
             # (Pylance) treat it correctly.
             send_realtime = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_realtime_input"))
-
-            # Prefer sending as a JSON-friendly dict with base64 data to avoid
-            # websocket text-frame encoding issues observed on some environments.
-            if audio_b64 is not None:
-                try:
-                    await send_realtime(audio={"data": audio_b64, "mime_type": blob.mime_type})
-                    _LOGGER.debug("send_audio: send successful via base64 dict %d bytes", len(audio_data))
-                except Exception:
-                    # Fallback to binary Blob if base64 dict is rejected
-                    _LOGGER.debug("send_audio: base64 dict send failed; falling back to Blob for %d bytes", len(audio_data))
-                    await send_realtime(audio=blob)
-                    _LOGGER.debug("send_audio: send successful via Blob %d bytes", len(audio_data))
-            else:
-                # If base64 conversion failed, send raw blob
+            
+            # Send raw bytes as per Google's official example:
+            # await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm"})
+            # The SDK handles serialization internally.
+            try:
+                await send_realtime(audio={"data": bytes(audio_data), "mime_type": blob.mime_type})
+                _LOGGER.debug("send_audio: send successful via raw bytes dict %d bytes", len(audio_data))
+            except Exception as dict_err:
+                # Fallback to Blob object if dict format is rejected
+                _LOGGER.debug("send_audio: raw bytes dict failed (%s); falling back to Blob for %d bytes", dict_err, len(audio_data))
                 await send_realtime(audio=blob)
                 _LOGGER.debug("send_audio: send successful via Blob %d bytes", len(audio_data))
         except Exception as e:
@@ -1402,6 +1901,22 @@ class GeminiLiveClient:
                     except Exception as fallback_exc:
                         _LOGGER.warning("send_audio: fallback send failed: %s", fallback_exc)
                         _LOGGER.warning("send_audio: fatal frame error detected, closing session")
+                        # Dump recent ws frames if available to aid diagnosis
+                        try:
+                            ws = None
+                            if self._session:
+                                ws = getattr(self._session, "_ws", None) or getattr(self._session, "ws", None) or getattr(self._session, "_transport", None)
+                            if ws and getattr(ws, "_frame_logger_history", None):
+                                _LOGGER.error("send_audio: recent ws frames (most recent last):")
+                                for idx, entry in enumerate(list(getattr(ws, "_frame_logger_history", []))):
+                                    try:
+                                        direction, opcode, length, preview_b64, full_b64 = entry
+                                        prefix = full_b64[:1024]
+                                        _LOGGER.error("  [%02d] %s opcode=%s bytes=%d preview_b64=%s full_b64_prefix=%s", idx, direction, opcode, length, preview_b64, prefix)
+                                    except Exception:
+                                        _LOGGER.error("  [%02d] frame: (uninspectable)", idx)
+                        except Exception:
+                            pass
                         self._connected = False
                         try:
                             if self._session_context:
@@ -1528,71 +2043,125 @@ class GeminiLiveClient:
         """Send function call result back to the API.
         
         Uses session.send_tool_response() as per official documentation.
+        
+        Note: MCP servers return JSON-RPC responses like:
+        {"jsonrpc": "2.0", "id": 123, "result": {"content": [...]}}
+        
+        Gemini expects a simple result object, so we extract the content.
+        The response is also truncated and made ASCII-safe to avoid 1007 errors.
         """
         if not self._connected or not self._session:
             return
 
+        # Log function response count at entry
+        _LOGGER.debug(
+            "send_function_result: STARTING RESPONSE #%d call_id=%s result_type=%s result_size=%d",
+            self._function_response_count + 1, call_id, type(result).__name__, len(str(result))
+        )
+
+        # Minimal, robust implementation: extract MCP result, sanitize,
+        # and handle carefully to avoid 1007 errors.
+        func_info = self._pending_function_calls.pop(call_id, {})
+        func_name = func_info.get("name", "")
+        
+        # Log function info for debugging
+        _LOGGER.debug("send_function_result: call_id=%s func_name=%s func_info=%s", call_id, func_name, func_info)
+        
+        # Validate we have required info
+        if not func_name:
+            _LOGGER.warning("send_function_result: missing func_name for call_id=%s, this may cause API errors", call_id)
+
+        # First, extract actual result from MCP JSON-RPC envelope if present
         try:
-            # Get the function name from pending calls
-            func_info = self._pending_function_calls.pop(call_id, {})
-            func_name = func_info.get("name", "")
+            extracted = self._extract_mcp_result(result)
+            _LOGGER.debug("send_function_result: extracted MCP result for call_id=%s: %s", call_id, str(extracted)[:500])
+        except Exception as e:
+            _LOGGER.warning("send_function_result: failed to extract MCP result, using original: %s", e)
+            extracted = result
 
-            # Sanitize and validate the result payload to avoid sending
-            # binary or non-serializable types which can trigger invalid
-            # frame errors on the underlying websocket.
-            try:
-                sanitized = self._sanitize_for_json(result)
-            except Exception as e:
-                _LOGGER.error("send_function_result: failed to sanitize result for call_id=%s: %s", call_id, e)
-                await self._emit(EVENT_ERROR, {"error": f"failed to sanitize function result: {e}"})
-                return
+        try:
+            sanitized = self._sanitize_for_json(extracted)
+        except Exception as e:
+            _LOGGER.error("send_function_result: failed to sanitize result for call_id=%s: %s", call_id, e)
+            await self._emit(EVENT_ERROR, {"error": f"failed to sanitize function result: {e}"})
+            return
 
-            try:
-                dumped = json.dumps(sanitized)
-            except (TypeError, ValueError) as e:
-                _LOGGER.error("send_function_result: sanitized result still not serializable for call_id=%s: %s", call_id, e)
-                await self._emit(EVENT_ERROR, {"error": f"function result not JSON-serializable: {e}"})
-                return
+        # Ensure top-level dict
+        if not isinstance(sanitized, dict):
+            sanitized = {"text": str(sanitized)}
 
-            # Limit payload size to avoid oversized frames (64 KiB)
-            max_size = 64 * 1024
-            byte_len = len(dumped.encode("utf-8"))
-            if byte_len > max_size:
-                _LOGGER.error("send_function_result: sanitized result too large (%d bytes) for call_id=%s", byte_len, call_id)
-                await self._emit(EVENT_ERROR, {"error": "function result too large to send"})
-                return
+        _LOGGER.debug("send_function_result: payload size=%d bytes for call_id=%s", 
+                     len(json.dumps(sanitized, ensure_ascii=False)), call_id)
 
-            # Create function response using the sanitized payload
-            function_response = types.FunctionResponse(
-                id=call_id,
-                name=func_name,
-                response=sanitized,
+        # Prepare a function response using the SDK types
+        # Pass the sanitized dict directly - the SDK should handle JSON serialization
+        function_response = types.FunctionResponse(id=call_id, name=func_name, response=sanitized)
+
+        send_tool = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_tool_response"))
+
+        try:
+            await self._install_ws_frame_logger(duration=8)
+        except Exception:
+            pass
+
+        # Log the actual payload being sent for debugging
+        try:
+            payload_preview = json.dumps(sanitized, ensure_ascii=False, default=str)[:1000]
+            _LOGGER.info("send_function_result: sending response call_id=%s name=%s payload_preview=%s", 
+                        call_id, func_name, payload_preview)
+        except Exception:
+            _LOGGER.info("send_function_result: sending response call_id=%s name=%s (payload preview failed)", 
+                        call_id, func_name)
+
+        try:
+            await send_tool(function_responses=[function_response])
+            self._function_response_count += 1
+            _LOGGER.debug(
+                "send_function_result: RESPONSE #%d sent successfully call_id=%s func_name=%s",
+                self._function_response_count, call_id, func_name
             )
-
-            # Debug: compact preview of function response payload (avoid dumping full content)
             try:
-                sample = dumped[:200] if isinstance(dumped, str) else None
-                _LOGGER.debug(
-                    "send_function_result: preview=%s",
-                    {
-                        "call_id": call_id,
-                        "name": func_name,
-                        "response_bytes": byte_len,
-                        "sample": sample,
-                    },
-                )
+                self._last_sent_was_function_response = True
             except Exception:
                 pass
-
-            # Send the response using send_tool_response (official API method)
-            send_tool = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_tool_response"))
-            await send_tool(
-                function_responses=[function_response]
-            )
-            _LOGGER.info("Sent function result for call_id=%s", call_id)
-
+            return
         except Exception as e:
-            _LOGGER.error("Error sending function result: %s", e)
+            err_str = str(e)
+            _LOGGER.error("Error sending function result for call_id=%s: %s", call_id, e)
+            _LOGGER.exception("send_function_result: full exception")
+            
+            # Try even more aggressive ASCII/text fallback for invalid-frame-like errors
+            if "1007" in err_str or "invalid frame" in err_str.lower() or "invalid frame payload" in err_str.lower() or "invalid argument" in err_str.lower():
+                try:
+                    # Use a very conservative payload with ASCII-only content
+                    ascii_dump = json.dumps(sanitized, ensure_ascii=True)
+                    # Truncate further for fallback
+                    if len(ascii_dump) > 2000:
+                        ascii_dump = ascii_dump[:2000] + "...[truncated]"
+                    fallback_payload = {"text": ascii_dump}
+                    fallback_response = types.FunctionResponse(id=call_id, name=func_name, response=fallback_payload)
+                    _LOGGER.info("send_function_result: attempting ASCII fallback for call_id=%s", call_id)
+                    await send_tool(function_responses=[fallback_response])
+                    try:
+                        self._last_sent_was_function_response = True
+                    except Exception:
+                        pass
+                    return
+                except Exception as fallback_err:
+                    _LOGGER.warning("send_function_result: ascii fallback failed for call_id=%s: %s", call_id, fallback_err)
+
+            # If fallback failed or not applicable, close session on fatal frame errors
+            if "1007" in err_str or "invalid frame" in err_str.lower() or "invalid frame payload" in err_str.lower():
+                _LOGGER.warning("send_function_result: invalid-frame error detected, closing session (call_id=%s)", call_id)
+                self._connected = False
+                try:
+                    if self._session_context:
+                        await self._session_context.__aexit__(type(e), e, getattr(e, '__traceback__', None))
+                except Exception:
+                    _LOGGER.debug("send_function_result: error closing session context after frame error", exc_info=True)
+                self._session = None
+                self._session_context = None
+            await self._emit(EVENT_ERROR, {"error": err_str})
 
     async def get_audio_chunk(self, timeout: float = 0.1) -> bytes | None:
         """Get an audio chunk from the receive queue."""
@@ -1744,6 +2313,8 @@ class GeminiLiveClient:
         """Clear the conversation history."""
         self._current_response = None
         self._pending_function_calls.clear()
+        self._processing_function_call = False
+        self._last_turn_complete_time = 0.0
 
     def update_config(self, **kwargs) -> None:
         """Update session configuration."""
