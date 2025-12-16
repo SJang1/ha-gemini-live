@@ -697,24 +697,40 @@ class GeminiLiveClient:
                 break
             except Exception as e:
                 error_str = str(e)
-                # Check if this is a WebSocket close that should stop the loop
-                # 1000 = normal closure, 1011 = internal error (deadline expired)
-                if "1000" in error_str or "1011" in error_str or "closed" in error_str.lower():
+                # Treat common close codes as clean/fatal closures and stop the loop
+                # 1000 = normal closure, 1001 = going away, 1008 = policy violation, 1011 = internal error
+                close_codes = ("1000", "1001", "1008", "1011")
+                if any(code in error_str for code in close_codes) or "closed" in error_str.lower():
+                    # Provide specialized logging for known codes
                     if "1011" in error_str:
                         _LOGGER.info("WebSocket connection terminated (deadline expired)")
+                    elif "1008" in error_str or "policy violation" in error_str.lower():
+                        _LOGGER.error("Policy error in receive loop; closing session: %s", error_str)
                     else:
-                        _LOGGER.info("WebSocket connection closed normally")
+                        _LOGGER.info("WebSocket connection closed: %s", error_str)
+
+                    # Clean up session context and mark disconnected
                     self._connected = False
-                    await self._emit(EVENT_ERROR, {"error": "Connection closed"})
-                    break  # Exit the loop, don't retry
-                else:
-                    _LOGGER.error("Error in receive loop: %s", e)
+                    try:
+                        if self._session_context:
+                            try:
+                                await self._session_context.__aexit__(type(e), e, getattr(e, '__traceback__', None))
+                            except Exception as cerr:
+                                _LOGGER.debug("Error closing session context after close: %s", cerr)
+                    except Exception:
+                        pass
+                    self._session = None
+                    self._session_context = None
                     await self._emit(EVENT_ERROR, {"error": error_str})
-                    # Only retry for unexpected errors, with exponential backoff
-                    if self._connected:
-                        await asyncio.sleep(1.0)
-                    else:
-                        break
+                    break
+
+                # Other unexpected errors - log and emit, may retry briefly if still connected
+                _LOGGER.error("Error in receive loop: %s", e)
+                await self._emit(EVENT_ERROR, {"error": error_str})
+                if self._connected:
+                    await asyncio.sleep(1.0)
+                else:
+                    break
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
         """Handle function/tool calls from the model."""
