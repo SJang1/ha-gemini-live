@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from aiohttp import ClientSession
+from urllib.parse import urlparse, urlunparse
+import socket
 
 from .const import (
     CONF_MCP_SERVER_NAME,
@@ -34,10 +36,11 @@ def _strip_surrounding_quotes(val: str) -> str:
     """Remove surrounding single or double quotes from a string."""
     if not isinstance(val, str):
         return val
+    # Trim whitespace first
     s = val.strip()
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        return s[1:-1]
-    return s
+    # Remove any leading or trailing single or double quote characters.
+    # Use strip so that unmatched or stray quotes (e.g. trailing ") are removed too.
+    return s.strip('"\'')
 
 
 def _mask_token(token: str | None) -> str:
@@ -51,6 +54,40 @@ def _mask_token(token: str | None) -> str:
     if t.lower().startswith("bearer "):
         return "Bearer ****"
     return "****"
+
+
+def _normalize_auth_value(val: str | None) -> str | None:
+    """Normalize various forms of an authorization/header value into a safe header value.
+
+    Accepts raw token (eyJ...), full header (Bearer ...), or a string like
+    'Authorization: Bearer ...' and returns a value suitable for the
+    Authorization header (e.g. 'Bearer eyJ...'). Returns None if input is falsy.
+    """
+    if not val:
+        return None
+    try:
+        s = _strip_surrounding_quotes(val).strip()
+    except Exception:
+        s = str(val).strip()
+
+    # If the user pasted a full header like 'Authorization: Bearer ...', remove the leading key
+    if ":" in s and s.lower().startswith("authorization"):
+        try:
+            _, rest = s.split(":", 1)
+            s = rest.strip()
+        except Exception:
+            pass
+
+    # If already starts with Bearer, return as-is
+    if s.lower().startswith("bearer "):
+        return s
+
+    # Otherwise assume it's a raw token and prefix
+    if s:
+        return f"Bearer {s}"
+
+    return None
+
 
 
 @dataclass
@@ -126,6 +163,7 @@ class MCPServerHandler:
         headers: dict[str, str] | None = None,
     ) -> None:
         """Add an MCP server."""
+        # Do not normalize or modify the user's provided token/header values here.
         self._servers[name] = MCPServer(
             name=name,
             type=server_type,
@@ -184,6 +222,18 @@ class MCPServerHandler:
                     _LOGGER.debug("Could not parse headers string for server %s: %s", config.get(CONF_MCP_SERVER_NAME), headers_val)
                     headers_val = {}
 
+            # If the user provided an explicit Authorization value in the config
+            # (CONF_MCP_SERVER_AUTH_HEADER or legacy token), prefer using that
+            # verbatim as an HTTP header instead of normalizing or adding prefixes.
+            try:
+                auth_raw = config.get(CONF_MCP_SERVER_AUTH_HEADER, config.get(CONF_MCP_SERVER_TOKEN))
+                if auth_raw:
+                    # Only set Authorization header if not already provided in parsed headers
+                    if isinstance(headers_val, dict) and not any(k.lower() == "authorization" for k in headers_val.keys()):
+                        headers_val["Authorization"] = _strip_surrounding_quotes(auth_raw)
+            except Exception:
+                pass
+
         _LOGGER.debug(
             "Adding MCP server from config: %s (args=%s, env=%s, headers=%s)",
             config.get(CONF_MCP_SERVER_NAME),
@@ -192,11 +242,13 @@ class MCPServerHandler:
             headers_val,
         )
 
+        # Pass the raw auth via headers (if present); leave token alone so
+        # we don't attempt to mutate or prefix it later.
         self.add_server(
             name=config.get(CONF_MCP_SERVER_NAME, ""),
             server_type=config.get(CONF_MCP_SERVER_TYPE, "sse"),
             url=config.get(CONF_MCP_SERVER_URL),
-            token=config.get(CONF_MCP_SERVER_AUTH_HEADER, config.get(CONF_MCP_SERVER_TOKEN)),
+            token=config.get(CONF_MCP_SERVER_TOKEN),
             command=config.get(CONF_MCP_SERVER_COMMAND),
             args=args_val,
             env=env_val,
@@ -286,6 +338,59 @@ class MCPServerHandler:
             return False
 
         try:
+            async def _attempt_alternate_host_post(orig_url: str, payload: Any, hdrs: dict[str, str], timeout: int = 10):
+                """Try posting to alternate hostnames/IPs when the original URL returned 401.
+
+                Returns tuple (status:int, data: Any, used_url: str) or (None, None, None).
+                """
+                try:
+                    parsed = urlparse(orig_url)
+                    host = parsed.hostname or ""
+                    portsuf = f":{parsed.port}" if parsed.port else ""
+                    candidates: list[str] = []
+                    # If host is localhost or 127.0.0.1, try both forms and the machine IP
+                    if host in ("localhost", "127.0.0.1"):
+                        candidates.extend(["127.0.0.1"])
+                        try:
+                            ip = socket.gethostbyname(socket.gethostname())
+                            if ip and ip not in candidates and ip != host:
+                                candidates.append(ip)
+                        except Exception:
+                            pass
+                    else:
+                        # Try resolving hostname to IP
+                        try:
+                            ip = socket.gethostbyname(host)
+                            if ip and ip != host:
+                                candidates.append(ip)
+                        except Exception:
+                            pass
+
+                    for candidate in candidates:
+                        new_netloc = f"{candidate}{portsuf}"
+                        new_url = urlunparse((parsed.scheme, new_netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+                        try:
+                            masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in hdrs.items()}
+                            _LOGGER.debug("Retrying POST to alternate host %s headers=%s", new_url, masked)
+                        except Exception:
+                            pass
+                        try:
+                            async with self._session.post(new_url, json=payload, headers=hdrs, timeout=timeout) as resp2:
+                                st = resp2.status
+                                ctype2 = resp2.headers.get("Content-Type", "")
+                                text2 = await resp2.text()
+                                if st == 200:
+                                    try:
+                                        return st, await resp2.json(), new_url
+                                    except Exception:
+                                        return st, text2, new_url
+                                _LOGGER.debug("Alternate host POST %s returned %s body=%s", new_url, st, text2[:500])
+                        except Exception as e:
+                            _LOGGER.debug("Alternate host POST to %s failed: %s", new_url, e)
+                except Exception:
+                    pass
+                return None, None, None
+
             # Prepare headers and token like SSE calls
             request_headers = {**(server.headers or {})}
             if server.token:
@@ -308,6 +413,14 @@ class MCPServerHandler:
                 pass
 
             base = server.url.rstrip("/")
+            # Ensure Host header matches the target netloc (helps proxies/auth that rely on Host)
+            try:
+                parsed_base = urlparse(base)
+                base_netloc = parsed_base.netloc
+                if base_netloc and not any(h.lower() == "host" for h in request_headers):
+                    request_headers["Host"] = base_netloc
+            except Exception:
+                base_netloc = None
 
             # Build Accept header per spec: support JSON and event-stream
             request_headers.setdefault("Accept", "application/json, text/event-stream")
@@ -327,6 +440,23 @@ class MCPServerHandler:
             headers_with_sid = {**request_headers}
 
             try:
+                # Log masked headers that will be sent with initialize POST for diagnostics
+                try:
+                    masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in request_headers.items()}
+                    _LOGGER.debug("HTTP initialize POST headers for %s: %s", server.name, masked)
+                except Exception:
+                    pass
+
+                # Detect double-Bearer without printing token
+                try:
+                    auth_val = request_headers.get("Authorization") if isinstance(request_headers, dict) else None
+                    double_bearer = False
+                    if isinstance(auth_val, str):
+                        double_bearer = auth_val.lower().count("bearer") > 1
+                    _LOGGER.debug("Initialize POST Authorization double_bearer=%s", double_bearer)
+                except Exception:
+                    pass
+
                 # Use raw post so we can keep the response open if it's an SSE stream.
                 resp = await self._session.post(f"{base}", json=init_message, headers=request_headers, timeout=10)
                 # If server accepts initialize, it may return JSON or an SSE stream.
@@ -334,6 +464,26 @@ class MCPServerHandler:
                     # Old HTTP+SSE server or unsupported: fallback to opening GET to parse endpoint event
                     _LOGGER.debug("Initialize POST returned %d: falling back to GET for %s", resp.status, server.name)
                     init_failed = True
+                    # If 401 Unauthorized, try alternate host forms (IP instead of localhost)
+                    if resp.status == 401:
+                        try:
+                            st, data_alt, used_url = await _attempt_alternate_host_post(base, init_message, request_headers, timeout=10)
+                            if st == 200 and data_alt is not None:
+                                # Use alternate URL as base
+                                parsed_used = urlparse(used_url)
+                                alt_base = f"{parsed_used.scheme}://{parsed_used.netloc}"
+                                server.url = alt_base
+                                headers_with_sid = {**request_headers}
+                                # if data_alt contains session id, set it
+                                if isinstance(data_alt, dict):
+                                    sid = data_alt.get("sessionId") or data_alt.get("mcpSessionId") or data_alt.get("result", {}).get("sessionId")
+                                    if sid:
+                                        server.session_id = sid
+                                        headers_with_sid["Mcp-Session-Id"] = server.session_id
+                                init_failed = False
+                                _LOGGER.info("Initialize succeeded via alternate host %s for %s", used_url, server.name)
+                        except Exception:
+                            pass
                 else:
                     init_failed = False
                     sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
@@ -372,7 +522,9 @@ class MCPServerHandler:
             if init_failed:
                 try:
                     # per backwards compatibility, try GET and expect 'endpoint' event
-                    async with self._session.get(base, headers={"Accept": "text/event-stream"}, timeout=10) as get_resp:
+                    # Use the same headers we would use for POST (including Authorization/session id)
+                    get_headers = {**headers_with_sid, "Accept": "text/event-stream"}
+                    async with self._session.get(base, headers=get_headers, timeout=10) as get_resp:
                         if get_resp.status == 200 and "text/event-stream" in get_resp.headers.get("Content-Type", ""):
                             # parse the first SSE event and look for endpoint in data
                             endpoint = None
@@ -414,6 +566,11 @@ class MCPServerHandler:
             # Send initialized notification (best-effort) to confirm initialization
             try:
                 notif = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                try:
+                    masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in headers_with_sid.items()}
+                    _LOGGER.debug("Initialize notification POST to %s headers=%s", base, masked)
+                except Exception:
+                    pass
                 await self._session.post(f"{base}", json=notif, headers=headers_with_sid, timeout=5)
             except Exception:
                 pass
@@ -425,18 +582,47 @@ class MCPServerHandler:
             async def _try_fetch_tools(url: str, method: str = "post"):
                 try:
                     _LOGGER.debug("Attempting %s %s for tools (server=%s)", method.upper(), url, server.name)
+                    try:
+                        hdrs_for_log = request_headers if request_headers is not None else {}
+                        masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in hdrs_for_log.items()}
+                        _LOGGER.debug("Tools fetch headers for %s: %s", server.name, masked)
+                    except Exception:
+                        pass
+
                     if method.lower() == "post":
                         # Some MCP HTTP servers expect JSON-RPC payloads for tools/list
                         payload = {}
                         if url.rstrip("/").endswith("/tools/list") or url.rstrip("/") == base.rstrip("/"):
                             payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
 
-                        async with self._session.post(url, json=payload, headers=headers_with_sid, timeout=10) as resp:
+                        try:
+                            auth_val = request_headers.get("Authorization") if isinstance(request_headers, dict) else None
+                            double_bearer = False
+                            if isinstance(auth_val, str):
+                                double_bearer = auth_val.lower().count("bearer") > 1
+                            _LOGGER.debug("Tools POST Authorization double_bearer=%s", double_bearer)
+                        except Exception:
+                            pass
+
+                        async with self._session.post(url, json=payload, headers=request_headers, timeout=10) as resp:
                             status = resp.status
                             ctype = resp.headers.get("Content-Type", "")
                             text = await resp.text()
                             _LOGGER.debug("Tools fetch resp status=%s content-type=%s body=%s", status, ctype, text[:1000])
                             if resp.status != 200:
+                                # If unauthorized, try alternate host for this POST
+                                if resp.status == 401:
+                                    try:
+                                        st2, data2, used2 = await _attempt_alternate_host_post(url, payload, request_headers, timeout=10)
+                                        if st2 == 200 and data2 is not None:
+                                            # discovered via alternate host
+                                            parsed_used2 = urlparse(used2)
+                                            alt_base2 = f"{parsed_used2.scheme}://{parsed_used2.netloc}"
+                                            server.url = alt_base2
+                                            # keep using the same request headers
+                                            return data2, st2, None
+                                    except Exception:
+                                        pass
                                 return None, status, text
                             # If the server returned an SSE stream as a whole in the
                             # response body, try to extract JSON from `data:` lines.
@@ -468,7 +654,12 @@ class MCPServerHandler:
                                 return text, status, None
                     else:
                         # Some servers require GET requests to include Accept: text/event-stream
-                        get_headers = {**headers_with_sid, "Accept": "text/event-stream, application/json"}
+                        get_headers = {**(request_headers or {}), "Accept": "text/event-stream, application/json"}
+                        try:
+                            masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in get_headers.items()}
+                            _LOGGER.debug("Tools fetch GET to %s headers=%s", url, masked)
+                        except Exception:
+                            pass
                         async with self._session.get(url, headers=get_headers, timeout=10) as resp:
                             status = resp.status
                             ctype = resp.headers.get("Content-Type", "")
@@ -559,12 +750,17 @@ class MCPServerHandler:
 
             server.connected = True
 
-            # Attempt to open a listening GET SSE stream for server-initiated messages (optional)
+                # Attempt to open a listening GET SSE stream for server-initiated messages (optional)
             try:
-                # Use Last-Event-ID support when we reconnect later; we don't have an ID now
-                get_headers = {"Accept": "text/event-stream"}
+                # Use Last-Event-ID support when we reconnect later; include Authorization/session headers
+                get_headers = {**headers_with_sid, "Accept": "text/event-stream"}
                 if server.session_id:
                     get_headers["Mcp-Session-Id"] = server.session_id
+                    try:
+                        masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in get_headers.items()}
+                        _LOGGER.debug("Opening SSE listening GET to %s headers=%s", base, masked)
+                    except Exception:
+                        pass
                 resp = await self._session.get(base, headers=get_headers, timeout=10)
                 ctype = resp.headers.get("Content-Type", "")
                 if resp.status == 200 and "text/event-stream" in ctype:
@@ -902,7 +1098,13 @@ class MCPServerHandler:
         # If this is an HTTP/Streamable-HTTP server, optionally send DELETE to terminate session
         if server.type == "http" and server.url and server.session_id:
             try:
-                await self._session.delete(server.url, headers={"Mcp-Session-Id": server.session_id}, timeout=5)
+                del_headers = {"Mcp-Session-Id": server.session_id}
+                try:
+                    masked = {k: ("****" if k.lower() == "authorization" else v) for k, v in del_headers.items()}
+                    _LOGGER.debug("DELETE session to %s headers=%s", server.url, masked)
+                except Exception:
+                    pass
+                await self._session.delete(server.url, headers=del_headers, timeout=5)
             except Exception:
                 pass
 
@@ -1026,17 +1228,70 @@ class MCPServerHandler:
             except Exception:
                 pass
 
-            url = f"{server.url.rstrip('/')}/tools/{tool_name}"
-            _LOGGER.debug("SSE tool POST %s headers=%s body=%s", url, {k: ("****" if k.lower()=="authorization" else v) for k,v in request_headers.items()}, arguments)
-            async with self._session.post(url, json=arguments, headers=request_headers, timeout=30) as resp:
-                text = await resp.text()
-                _LOGGER.debug("SSE tool response status=%s body=%s", resp.status, text[:2000])
-                if resp.status == 200:
-                    try:
-                        return await resp.json()
-                    except Exception:
-                        return {"result": text}
-                return {"error": f"Tool call failed: {text}", "status": resp.status}
+            # Build JSON-RPC tools/call request per MCP spec
+            rpc_request = {
+                "jsonrpc": "2.0",
+                "id": 100 + int(asyncio.get_event_loop().time()) % 100000,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            }
+
+            primary = f"{server.url.rstrip('/')}/tools/call"
+            fallback = f"{server.url.rstrip('/')}"
+            tried = []
+            for url in (primary, fallback):
+                _LOGGER.debug("SSE tool POST attempt %s headers=%s rpc=%s", url, {k: ("****" if k.lower()=="authorization" else v) for k,v in request_headers.items()}, rpc_request)
+                try:
+                    auth_val = request_headers.get("Authorization") if isinstance(request_headers, dict) else None
+                    double_bearer = False
+                    if isinstance(auth_val, str):
+                        double_bearer = auth_val.lower().count("bearer") > 1
+                    _LOGGER.debug("SSE tool POST Authorization double_bearer=%s", double_bearer)
+                except Exception:
+                    pass
+                async with self._session.post(url, json=rpc_request, headers=request_headers, timeout=30) as resp:
+                    ctype = resp.headers.get("Content-Type", "")
+                    text = await resp.text()
+                    _LOGGER.debug("SSE tool response from %s status=%s content-type=%s body=%s", url, resp.status, ctype, text[:2000])
+
+                    # If endpoint not found, try next
+                    if resp.status in (404, 405):
+                        tried.append((url, resp.status, text))
+                        _LOGGER.debug("SSE tool endpoint %s returned %s, trying next fallback", url, resp.status)
+                        continue
+
+                    # Non-200 error
+                    if resp.status != 200:
+                        return {"error": f"Tool call failed: {text}", "status": resp.status}
+
+                    # If JSON, return parsed
+                    if "application/json" in ctype:
+                        try:
+                            return await resp.json()
+                        except Exception:
+                            return {"result": text}
+
+                    # If SSE stream or text, try to extract JSON data blocks
+                    if "text/event-stream" in ctype or text.startswith("event:") or text.strip().startswith("{"):
+                        data_lines = []
+                        for line in text.splitlines():
+                            if line.startswith("data:"):
+                                data_lines.append(line[len("data:"):].strip())
+                        data_text = "\n".join(data_lines).strip()
+                        if data_text:
+                            try:
+                                j = json.loads(data_text)
+                                return j
+                            except Exception:
+                                pass
+
+                        try:
+                            j = json.loads(text)
+                            return j
+                        except Exception:
+                            return {"result": text}
+
+                    return {"result": text}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1117,31 +1372,47 @@ class MCPServerHandler:
             except Exception:
                 pass
 
-            url = server.url.rstrip("/") + f"/tools/{tool_name}"
+            # Build JSON-RPC tools/call request per MCP spec
+            rpc_request = {
+                "jsonrpc": "2.0",
+                "id": 200 + int(asyncio.get_event_loop().time()) % 100000,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            }
 
-            _LOGGER.debug("HTTP tool POST %s headers=%s body=%s", url, {k: ("****" if k.lower()=="authorization" else v) for k,v in headers.items()}, arguments)
-            async with self._session.post(url, json=arguments, headers=headers, timeout=30) as resp:
-                ctype = resp.headers.get("Content-Type", "")
-                text_body = await resp.text()
-                _LOGGER.debug("HTTP tool response status=%s content-type=%s body=%s", resp.status, ctype, text_body[:2000])
-                if resp.status == 200:
-                    # Try JSON first
-                    if "application/json" in ctype:
-                        try:
-                            return await resp.json()
-                        except Exception:
-                            return {"result": text_body}
-                    if "text/event-stream" in ctype:
-                        # parse SSE inline (simple parser)
-                        buffer_lines: list[str] = []
-                        async for raw in resp.content:
-                            if not raw:
-                                continue
+            primary = server.url.rstrip("/") + "/tools/call"
+            fallback = server.url.rstrip("/")
+            for url in (primary, fallback):
+                _LOGGER.debug("HTTP tool POST attempt %s headers=%s rpc=%s", url, {k: ("****" if k.lower()=="authorization" else v) for k,v in headers.items()}, rpc_request)
+                try:
+                    auth_val = headers.get("Authorization") if isinstance(headers, dict) else None
+                    double_bearer = False
+                    if isinstance(auth_val, str):
+                        double_bearer = auth_val.lower().count("bearer") > 1
+                    _LOGGER.debug("HTTP tool POST Authorization double_bearer=%s", double_bearer)
+                except Exception:
+                    pass
+                async with self._session.post(url, json=rpc_request, headers=headers, timeout=30) as resp:
+                    ctype = resp.headers.get("Content-Type", "")
+                    text_body = await resp.text()
+                    _LOGGER.debug("HTTP tool response from %s status=%s content-type=%s body=%s", url, resp.status, ctype, text_body[:2000])
+
+                    # If endpoint not found, try next fallback
+                    if resp.status in (404, 405):
+                        _LOGGER.debug("HTTP tool endpoint %s returned %s, trying fallback", url, resp.status)
+                        continue
+
+                    if resp.status == 200:
+                        # Try JSON first
+                        if "application/json" in ctype:
                             try:
-                                text = raw.decode(errors="replace")
+                                return await resp.json()
                             except Exception:
-                                text = str(raw)
-                            for line in text.splitlines():
+                                return {"result": text_body}
+                        if "text/event-stream" in ctype or text_body.startswith("event:"):
+                            # parse SSE inline (simple parser)
+                            buffer_lines: list[str] = []
+                            for line in text_body.splitlines():
                                 if line == "":
                                     data_lines = [ln[len("data:"):].strip() for ln in buffer_lines if ln.startswith("data:")]
                                     data_text = "\n".join(data_lines).strip()
@@ -1156,12 +1427,12 @@ class MCPServerHandler:
                                         pass
                                 else:
                                     buffer_lines.append(line)
-                        return {"error": "No response in SSE stream"}
-                    return {"result": text_body}
-                elif resp.status == 202:
-                    return {"status": "accepted"}
-                else:
-                    return {"error": f"Tool call failed: {text_body}", "status": resp.status}
+                            return {"error": "No response in SSE stream"}
+                        return {"result": text_body}
+                    elif resp.status == 202:
+                        return {"status": "accepted"}
+                    else:
+                        return {"error": f"Tool call failed: {text_body}", "status": resp.status}
 
         except Exception as e:
             return {"error": str(e)}

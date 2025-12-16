@@ -242,14 +242,19 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 continue
             mcp_handler: MCPServerHandler | None = data.get("mcp_handler")
             if mcp_handler:
+                # If an authorization value was provided, pass it verbatim as a header
+                add_headers = {}
+                if authorization:
+                    add_headers["Authorization"] = authorization
                 mcp_handler.add_server(
                     name=name,
                     server_type=server_type,
                     url=url,
-                    token=authorization,
+                    token=None,
                     command=command,
                     args=args,
                     env=env,
+                    headers=add_headers,
                 )
                 await mcp_handler.connect_server(name)
                 _LOGGER.info("Added MCP server: %s (type: %s)", name, server_type)

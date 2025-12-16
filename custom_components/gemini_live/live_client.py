@@ -956,7 +956,28 @@ class GeminiLiveClient:
             # If conversion fails, fall back to sending raw decoded bytes and log
             _LOGGER.debug("send_audio_base64: WAV detection/conversion skipped: %s", e)
 
-        await self.send_audio(audio_data, sample_rate)
+        # If payload is large, send in chunks to avoid oversized websocket frames
+        try:
+            max_chunk = 32 * 1024
+            if len(audio_data) > max_chunk:
+                _LOGGER.debug("send_audio_base64: large payload %d bytes, sending in %d-byte chunks", len(audio_data), max_chunk)
+                # Send slices sequentially
+                offset = 0
+                while offset < len(audio_data):
+                    chunk = audio_data[offset: offset + max_chunk]
+                    try:
+                        await self.send_audio(chunk, sample_rate)
+                    except Exception as e:
+                        _LOGGER.error("send_audio_base64: failed sending audio chunk at offset %d: %s", offset, e)
+                        raise
+                    offset += max_chunk
+                    # Yield briefly to let event loop process incoming frames
+                    await asyncio.sleep(0)
+            else:
+                await self.send_audio(audio_data, sample_rate)
+        except Exception as e:
+            _LOGGER.error("send_audio_base64: error sending audio payload (%d bytes): %s", len(audio_data), e)
+            await self._emit(EVENT_ERROR, {"error": f"send_audio failed: {e}"})
 
     async def send_audio_stream_end(self) -> None:
         """Signal end of audio stream.
