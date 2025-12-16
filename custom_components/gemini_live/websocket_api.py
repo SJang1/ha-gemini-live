@@ -901,10 +901,17 @@ async def websocket_send_image(
         return
 
     try:
+        # If frontend provided an empty mime_type (e.g., iOS HEIC often lacks file.type),
+        # fall back to a reasonable default and log for debugging.
+        if not mime_type:
+            _LOGGER.debug("send_image: empty mime_type from frontend, defaulting to image/jpeg for ws=%s client_uuid=%s", id(connection), client_uuid)
+            mime_type = "image/jpeg"
+
         _LOGGER.debug("send_image from ws=%s client_uuid=%s mime=%s size=%d", id(connection), client_uuid, mime_type, len(image_b64))
         await client.send_image_base64(image_b64, mime_type)
         connection.send_result(msg["id"], {"success": True})
     except Exception as e:
+        _LOGGER.error("Failed to send media from ws=%s client_uuid=%s mime=%s error=%s", id(connection), client_uuid, mime_type, e)
         connection.send_error(msg["id"], "send_failed", str(e))
 
 
@@ -1850,6 +1857,70 @@ def websocket_subscribe(
 
         _deliver_event(data, mapped_uuid, connection, msg["id"], "error", event_data)
         _LOGGER.debug("Emitted error to connection %s client_uuid=%s: %s", connection_id, mapped_uuid, event_data)
+
+        # Perform server-side cleanup for fatal client errors so we don't leave
+        # stale per-connection clients, routes or subscriptions behind.
+        try:
+            clients = data.setdefault("clients", {})
+            connections_by_ws = data.setdefault("connections_by_ws", {})
+            routes = data.setdefault("routes", {})
+
+            # Prefer the explicit mapped uuid for this websocket, fall back to
+            # stored mapping or provided mapped_uuid variable
+            mapped = connections_by_ws.get(connection_id) or mapped_uuid
+            if mapped and mapped in clients:
+                client_entry = clients.get(mapped, {})
+                client_obj = client_entry.get("client")
+
+                # Mark route as disconnected
+                try:
+                    if mapped in routes:
+                        routes[mapped].server_connected = False
+                        routes[mapped].last_seen = asyncio.get_event_loop().time()
+                except Exception:
+                    _LOGGER.debug("Failed to update route status for %s", mapped)
+
+                # Attempt to disconnect/cleanup the client object if present
+                try:
+                    if client_obj:
+                        # Schedule a graceful disconnect; await so session tears down
+                        try:
+                            await client_obj.disconnect()
+                        except Exception:
+                            # Best-effort: log and continue
+                            _LOGGER.debug("Error while disconnecting client object for %s", mapped)
+                except Exception:
+                    _LOGGER.debug("Error attempting client_obj.disconnect() for %s", mapped)
+
+                # Clear stored client reference and per-connection state/subscriptions
+                try:
+                    client_entry["client"] = None
+                    client_entry.pop("client_states", None)
+                    # Remove any stored per-client subscriptions for this connection
+                    try:
+                        subs = client_entry.get("subscriptions", {})
+                        subs.pop(connection_id, None)
+                    except Exception:
+                        pass
+                except Exception:
+                    _LOGGER.debug("Failed to clear client entry for %s", mapped)
+
+                # Remove mapping from connections_by_ws
+                try:
+                    connections_by_ws.pop(connection_id, None)
+                except Exception:
+                    pass
+
+                _LOGGER.info("Cleaned up server-side client state for ws=%s client_uuid=%s", connection_id, mapped)
+
+                # Fire connected state change for sensors / automation
+                try:
+                    if entry_id:
+                        hass.bus.async_fire(f"{DOMAIN}_connected_state_changed", {"entry_id": entry_id, "is_connected": False})
+                except Exception:
+                    pass
+        except Exception as e:
+            _LOGGER.debug("Error during on_error cleanup: %s", e)
 
     async def on_interrupted(event_data: dict[str, Any]) -> None:
         try:

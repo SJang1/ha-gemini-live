@@ -10,6 +10,12 @@ const DOMAIN = "gemini_live";
 // Enable/disable debug logging
 const DEBUG_LOG = true;
 
+// Home Assistant websocket message size limit (bytes). Keep a small safety
+// margin so we don't accidentally exceed the server limit once JSON
+// overhead is included.
+const WS_MAX_MESSAGE_SIZE = 4194304; // 4 MiB
+const WS_SAFE_THRESHOLD = Math.floor(WS_MAX_MESSAGE_SIZE * 0.92);
+
 // Runtime load marker for debugging
 if (DEBUG_LOG && typeof window !== 'undefined' && window.console) {
     console.debug("GeminiLiveCard: module loaded (Gemini Live)");
@@ -62,6 +68,9 @@ class GeminiLiveCard extends HTMLElement {
         this._muteWhileSpeaking = true;
         // Keep microphone running when page/tab is hidden (default: true)
         this._keepMicWhenHidden = true;
+        // Whether microphone audio should be sent to the server
+        // This is controlled by the UI "Mic Off" toggle (default: disabled)
+        this._micEnabled = true;
 
         // File attachment
         this._selectedFile = null;
@@ -859,6 +868,12 @@ class GeminiLiveCard extends HTMLElement {
                 try { console.debug('AUDIO_PROCESS: skipping because not listening'); } catch (e) {}
                 return;
             }
+            
+            // Respect user's Mic On/Off toggle — when disabled, do not send audio
+            if (!this._micEnabled) {
+                try { console.debug('AUDIO_PROCESS: skipping because mic is disabled by user'); } catch (e) {}
+                return;
+            }
 
             // Optionally mute mic while AI is speaking to prevent feedback
             // Respect both playback-driven speaking and frontend-detected AI-mute
@@ -918,6 +933,38 @@ class GeminiLiveCard extends HTMLElement {
             // ignore localStorage errors
         }
         return payload;
+    }
+
+    // Estimate the byte size of a websocket message for a given payload
+    _estimateWSMessageSize(obj) {
+        try {
+            const json = JSON.stringify(obj);
+            // Use Blob to get accurate byte length in UTF-8
+            try {
+                return new Blob([json]).size;
+            } catch (e) {
+                // Fallback: approximate by string length (1 char ~= 1 byte for base64/ASCII)
+                return json.length;
+            }
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // Call Home Assistant websocket safely after checking estimated size.
+    async _callWSSafe(payload) {
+        if (!this._hass) throw new Error('No hass available');
+        try {
+            const size = this._estimateWSMessageSize(payload);
+            if (size > WS_MAX_MESSAGE_SIZE) {
+                const msg = `Websocket payload too large (${Math.round(size/1024)} KB). Limit ${Math.round(WS_MAX_MESSAGE_SIZE/1024)} KB.`;
+                this._showError(msg);
+                throw new Error(msg);
+            }
+            return await this._hass.callWS(payload);
+        } catch (e) {
+            throw e;
+        }
     }
 
     _resampleTo16kHz(inputData, fromRate, toRate) {
@@ -999,7 +1046,7 @@ class GeminiLiveCard extends HTMLElement {
             // Log audio send (without the actual base64 data for brevity)
             const payload = { type: `${DOMAIN}/send_audio`, audio: base64Audio, ...this._getClientPayload() };
             logWS('send', 'SEND_AUDIO', { size: base64Audio.length });
-            await this._hass.callWS(payload);
+            await this._callWSSafe(payload);
         } catch (e) {
             console.error("Failed to send audio:", e);
             logWS('recv', 'SEND_AUDIO_ERROR', { error: e.message });
@@ -1065,10 +1112,10 @@ class GeminiLiveCard extends HTMLElement {
 
             logWS('send', 'SEND_TEXT', { text: text });
             const payload = { type: `${DOMAIN}/send_text`, text: text, ...this._getClientPayload() };
-            const result = await this._hass.callWS(payload);
+            const result = await this._callWSSafe(payload);
             logWS('recv', 'SEND_TEXT_RESULT', result);
 
-            if (result.text || result.audio_transcript) {
+            if (result && (result.text || result.audio_transcript)) {
                 const respText = result.text || result.audio_transcript;
                 if (this._currentStreamingIndex !== null) {
                     const msg = this._messages[this._currentStreamingIndex];
@@ -1085,10 +1132,70 @@ class GeminiLiveCard extends HTMLElement {
             }
         } catch (e) {
             console.error("Failed to send text:", e);
-            logWS('recv', 'SEND_TEXT_ERROR', { error: e.message });
-            this._addMessage("system", `Error: ${e.message}`);
+            logWS('recv', 'SEND_TEXT_ERROR', { error: e && e.message });
+            this._addMessage("system", `Error: ${e && e.message ? e.message : 'unknown error'}`);
             this._render();
         }
+    }
+
+    // Attempt to compress/resize image files client-side to stay under the
+    // websocket size limit. Returns a base64 string (no data: prefix) or
+    // throws on failure.
+    _compressImageFile(file, maxBase64Len) {
+        return new Promise((resolve, reject) => {
+            try {
+                const img = new Image();
+                const reader = new FileReader();
+                reader.onload = () => {
+                    img.onload = async () => {
+                        try {
+                            // Start with original dimensions and reduce gradually
+                            let width = img.width;
+                            let height = img.height;
+                            // Compute scale factor target to try to get under max size
+                            let scale = 1.0;
+                            // Create canvas
+                            const canvas = document.createElement('canvas');
+                            const ctx = canvas.getContext('2d');
+
+                            // Try reducing quality and scale in a loop
+                            let quality = 0.92;
+                            for (let attempt = 0; attempt < 6; attempt++) {
+                                canvas.width = Math.max(1, Math.floor(width * scale));
+                                canvas.height = Math.max(1, Math.floor(height * scale));
+                                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                                const dataUrl = canvas.toDataURL(file.type || 'image/jpeg', quality);
+                                const b64 = dataUrl.split(',')[1] || '';
+                                if (b64.length <= maxBase64Len) {
+                                    resolve(b64);
+                                    return;
+                                }
+                                // Reduce quality and scale for next iteration
+                                quality = Math.max(0.3, quality - 0.15);
+                                scale *= 0.7; // reduce dimensions
+                            }
+                            // Final fallback: return last attempt if smaller than original
+                            const finalDataUrl = canvas.toDataURL(file.type || 'image/jpeg', quality);
+                            const finalB64 = finalDataUrl.split(',')[1] || '';
+                            if (finalB64.length <= maxBase64Len) {
+                                resolve(finalB64);
+                            } else {
+                                reject(new Error('Unable to compress image below size limit'));
+                            }
+                        } catch (err) {
+                            reject(err);
+                        }
+                    };
+                    img.onerror = (err) => reject(err || new Error('Failed to load image'));
+                    img.src = reader.result;
+                };
+                reader.onerror = (err) => reject(err || new Error('Failed to read file for compression'));
+                reader.readAsDataURL(file);
+            } catch (err) {
+                reject(err);
+            }
+        });
     }
 
     async _playAudio(base64Audio) {
@@ -1276,6 +1383,12 @@ class GeminiLiveCard extends HTMLElement {
                 const muteToggle = this.shadowRoot.getElementById('mute-toggle');
                 if (muteToggle) {
                     muteToggle.classList.toggle('active', this._muteWhileSpeaking);
+                }
+
+                // Update mic-off toggle visual state (active means mic is OFF)
+                const micToggle = this.shadowRoot.getElementById('mic-toggle');
+                if (micToggle) {
+                    micToggle.classList.toggle('active', !this._micEnabled);
                 }
 
                 // Update send button disabled state without altering the input
@@ -1673,6 +1786,11 @@ class GeminiLiveCard extends HTMLElement {
                 .toggle-switch.active {
                     background-color: var(--primary-color);
                 }
+
+                /* Mic Off toggle should be red when active (mic disabled) */
+                #mic-toggle.active {
+                    background-color: var(--error-color, #f44336);
+                }
                 
                 .toggle-switch::after {
                     content: '';
@@ -1783,6 +1901,9 @@ class GeminiLiveCard extends HTMLElement {
                 </div>
                 
                 <div class="options-row">
+                    <span class="option-label" id="mic-label">Mic Off</span>
+                    <div class="toggle-switch ${this._micEnabled ? '' : 'active'}" id="mic-toggle"></div>
+                             | 
                     <span class="option-label" id="mute-label">Mute while AI speaks</span>
                     <div class="toggle-switch ${this._muteWhileSpeaking ? 'active' : ''}" id="mute-toggle"></div>
                 </div>
@@ -1901,6 +2022,20 @@ class GeminiLiveCard extends HTMLElement {
                 muteLabel.addEventListener("click", toggleMute);
             }
         }
+
+        // Mic Off toggle (does not stop connection; only prevents sending mic audio)
+        const micToggle = this.shadowRoot.getElementById('mic-toggle');
+        const micLabel = this.shadowRoot.getElementById('mic-label');
+        if (micToggle) {
+            const toggleMic = () => {
+                this._micEnabled = !this._micEnabled;
+                // For the UI, active indicates "Mic Off" (so active when mic disabled)
+                micToggle.classList.toggle('active', !this._micEnabled);
+                console.log('Mic enabled:', this._micEnabled);
+            };
+            micToggle.addEventListener('click', toggleMic);
+            if (micLabel) micLabel.addEventListener('click', toggleMic);
+        }
     }
 
     async _sendFile(file) {
@@ -1920,20 +2055,42 @@ class GeminiLiveCard extends HTMLElement {
 
                 try {
                     if (mimeType.startsWith("image/")) {
-                        // Send image
-                        const payload = { type: `${DOMAIN}/send_image`, image: base64, mime_type: mimeType, ...this._getClientPayload() };
-                        await this._hass.callWS(payload);
+                        // Prepare payload and estimate size
+                        let payload = { type: `${DOMAIN}/send_image`, image: base64, mime_type: mimeType, ...this._getClientPayload() };
+                        let estimated = this._estimateWSMessageSize(payload);
+
+                        // If the estimated size is too large, attempt client-side compression
+                        if (estimated > WS_SAFE_THRESHOLD) {
+                            try {
+                                const compressedB64 = await this._compressImageFile(file, Math.floor(WS_SAFE_THRESHOLD));
+                                payload = { type: `${DOMAIN}/send_image`, image: compressedB64, mime_type: mimeType, ...this._getClientPayload() };
+                                estimated = this._estimateWSMessageSize(payload);
+                            } catch (compressErr) {
+                                console.warn('Image compression failed:', compressErr);
+                                this._showError('Image too large and compression failed. Choose a smaller image.');
+                                return;
+                            }
+                        }
+
+                        // Final send (will throw via _callWSSafe if still too large)
+                        await this._callWSSafe(payload);
                         this._inputTranscript = `[Sent image: ${file.name}]`;
+
                     } else if (mimeType.startsWith("audio/")) {
-                        // Send audio
+                        // For audio attachments, ensure size is safe; do not attempt lossy compression here
                         const payload = { type: `${DOMAIN}/send_audio`, audio: base64, ...this._getClientPayload() };
-                        await this._hass.callWS(payload);
+                        const estimated = this._estimateWSMessageSize(payload);
+                        if (estimated > WS_SAFE_THRESHOLD) {
+                            this._showError('Audio file too large to send over websocket. Trim or use streaming.');
+                            return;
+                        }
+                        await this._callWSSafe(payload);
                         this._inputTranscript = `[Sent audio: ${file.name}]`;
                     }
                     this._render();
                 } catch (err) {
                     console.error("Failed to send file:", err);
-                    this._showError(err.message);
+                    this._showError(err && err.message ? err.message : String(err));
                 }
             };
             reader.readAsDataURL(file);
