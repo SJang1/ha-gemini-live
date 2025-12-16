@@ -17,6 +17,7 @@ from .const import (
     CONF_ENABLE_GOOGLE_SEARCH,
     CONF_ENABLE_PROACTIVE_AUDIO,
     CONF_INSTRUCTIONS,
+    CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION,
     CONF_MCP_SERVER_ENABLED,
     CONF_MCP_SERVER_NAME,
     CONF_MCP_SERVER_TYPE,
@@ -135,15 +136,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         builtin_tools = []
 
-    # Add all MCP server tools (discovered above) as function tools
-    mcp_tools = mcp_handler.get_tools_as_functions()
-    all_tools = builtin_tools + mcp_tools
+    # Add all MCP server tools (discovered above).
+    # We keep built-in HA tools as flat function defs, but group MCP-provided
+    # tools by their server of origin so the client can create one Tool
+    # entry per MCP server (reduces oversized single-tool payloads).
+    mcp_grouped = mcp_handler.get_tools_grouped_by_server()
+    mcp_flat = mcp_handler.get_tools_as_functions()
+    all_tools = builtin_tools  # only include built-ins in the flat tools list
     _LOGGER.info(
-        "Total tools: %d builtin (included=%s) + %d MCP = %d",
+        "Total tools: %d builtin (included=%s) + %d MCP servers with %d total MCP funcs",
         len(builtin_tools),
         include_ha_tools,
-        len(mcp_tools),
-        len(all_tools),
+        len(mcp_grouped),
+        len(mcp_flat),
     )
 
     # Create session configuration with built-in tools
@@ -154,9 +159,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         temperature=config.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE),
         mcp_servers=mcp_servers,
         tools=all_tools,
+        mcp_tool_groups=mcp_grouped,
         enable_google_search=config.get(CONF_ENABLE_GOOGLE_SEARCH, True),
         enable_affective_dialog=config.get(CONF_ENABLE_AFFECTIVE_DIALOG, False),
         enable_proactive_audio=config.get(CONF_ENABLE_PROACTIVE_AUDIO, False),
+        context_window_compression=config.get(CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION, True),
     )
 
     # Create the live client (no session needed - uses google-genai)

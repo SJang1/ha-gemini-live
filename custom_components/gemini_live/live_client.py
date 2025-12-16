@@ -9,11 +9,12 @@ Based on official documentation:
 from __future__ import annotations
 
 import asyncio
+import json
 import base64
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, cast
 
 from google import genai
 from google.genai import types
@@ -58,6 +59,10 @@ class SessionConfig:
     temperature: float = DEFAULT_TEMPERATURE
     tools: list[dict[str, Any]] = field(default_factory=list)
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
+    # Mapping of MCP server name -> list of function dicts (grouped by origin)
+    mcp_tool_groups: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Allow disabling sending function/tool declarations (useful for debugging)
+    enable_tools: bool = True
     enable_google_search: bool = False
     enable_affective_dialog: bool = False
     enable_proactive_audio: bool = False
@@ -73,6 +78,8 @@ class SessionConfig:
     enable_session_resumption: bool = True
     # Ephemeral token (use instead of API key for client-side auth)
     ephemeral_token: str | None = None
+    # Tools mode: 'full' sends full parameter schemas; 'minimal' sends only name/description
+    tools_mode: str = "full"
 
 
 @dataclass
@@ -124,6 +131,8 @@ class GeminiLiveClient:
 
         # Function call handling
         self._pending_function_calls: dict[str, dict[str, Any]] = {}
+        # Mapping of function name -> behavior (e.g., 'NON_BLOCKING') from session config
+        self._function_behaviors: dict[str, str] = {}
 
         # Current response tracking
         self._current_response: LiveResponse | None = None
@@ -213,24 +222,96 @@ class GeminiLiveClient:
         """Build tools list for the session."""
         tools_list = []
 
+        # If tools are disabled in the config, return empty tools list immediately
+        if not getattr(self._session_config, "enable_tools", True):
+            _LOGGER.debug("_build_tools: tools disabled by session_config.enable_tools")
+            return tools_list
+
+        # Reset behavior mapping each time we build tools
+        try:
+            self._function_behaviors = {}
+        except Exception:
+            self._function_behaviors = {}
+
         # Add Google Search if enabled
         if self._session_config.enable_google_search:
             tools_list.append(types.Tool(google_search=types.GoogleSearch()))
 
         # Add function declarations from config
-        if self._session_config.tools:
-            function_declarations = []
-            for tool in self._session_config.tools:
-                # Convert our tool format to google-genai format
-                func_decl = types.FunctionDeclaration(
-                    name=tool.get("name", ""),
-                    description=tool.get("description", ""),
-                    parameters=self._convert_parameters(tool.get("parameters", {})),
-                )
-                function_declarations.append(func_decl)
+        # First, add any MCP-provided tools grouped by their server of origin.
+        # Use the original dicts (function definitions) as-is so we don't
+        # mutate schemas coming from MCP servers. This preserves the
+        # `function_declarations` objects exactly as discovered.
+        try:
+            mcp_groups = getattr(self._session_config, "mcp_tool_groups", {}) or {}
+            for server_name, funcs in mcp_groups.items():
+                if not funcs:
+                    continue
+                _LOGGER.debug("Building tools for MCP server %s with %d functions", server_name, len(funcs))
+                # Helper to sanitize raw function dicts into the minimal allowed
+                # shape accepted by the Live API SDK (name, description, parameters).
+                def _sanitize_fn_dict(f: dict[str, Any]) -> dict[str, Any]:
+                    if not isinstance(f, dict):
+                        return {"name": str(f)}
+                    name = f.get("name") or f.get("id") or ""
+                    desc = f.get("description") or (f.get("annotations") or {}).get("title") or ""
+                    params = f.get("parameters") or f.get("inputSchema") or f.get("input_schema") or {}
+                    return {"name": name, "description": desc, "parameters": params}
 
-            if function_declarations:
-                tools_list.append(types.Tool(function_declarations=function_declarations))
+                # Batch raw function dicts into sanitized tool dicts
+                try:
+                    # Preserve the full function list for each MCP server as a
+                    # single tool entry so the Live API sees all available
+                    # functions instead of splitting them into multiple tool
+                    # declarations. Some MCP servers expect the whole set to
+                    # be present together.
+                    sanitized = [_sanitize_fn_dict(f) for f in funcs]
+                    tools_list.append({"function_declarations": sanitized})
+                    _LOGGER.debug("Added sanitized Tool dict for server %s with %d functions", server_name, len(sanitized))
+                except Exception:
+                    _LOGGER.debug("Failed to add MCP tool group for %s; skipping", server_name, exc_info=True)
+        except Exception:
+            _LOGGER.debug("Error while building MCP tool groups", exc_info=True)
+
+        # Next, process any non-MCP tools that may be present in the flat tools list.
+        # If callers provided dict-shaped tool entries (e.g. raw `function_declarations`
+        # dicts or `google_search` dicts), include them unchanged. For legacy
+        # flat function defs (dict with name/description/parameters), we keep the
+        # prior behavior of grouping into Tool entries.
+        if self._session_config.tools:
+            flat_tools = getattr(self._session_config, "tools", []) or []
+            # Collect simple function defs (non-tool-dict entries) to batch
+            simple_funcs: list[dict[str, Any]] = []
+            for tool in flat_tools:
+                # If the tool is already a dict-shaped Tool (contains function_declarations or other top-level keys), pass it through unchanged
+                if isinstance(tool, dict) and ("function_declarations" in tool or any(k in tool for k in ("google_search", "google_search")) or any(not isinstance(v, dict) for v in tool.values())):
+                    # If this dict contains a `function_declarations` list, keep
+                    # the full list together as a single tool entry instead of
+                    # splitting it into multiple entries. Otherwise, pass the
+                    # dict through unchanged.
+                    if isinstance(tool.get("function_declarations"), (list, tuple)):
+                        fdecls = tool.get("function_declarations") or []
+                        tools_list.append(tool)
+                        _LOGGER.debug("Added raw Tool dict from flat tools with %d functions", len(fdecls))
+                    else:
+                        tools_list.append(tool)
+                    continue
+
+                # Otherwise treat as simple function definition (name/description/parameters)
+                if isinstance(tool, dict) and "name" in tool:
+                    simple_funcs.append(tool)
+                else:
+                    _LOGGER.debug("Ignoring unknown tool entry type in flat tools: %s", type(tool))
+
+            # If we have simple function defs, include them as a single
+            # tool entry so all functions are visible to the Live API.
+            if simple_funcs:
+                try:
+                    tools_list.append({"function_declarations": simple_funcs})
+                    _LOGGER.debug("Added raw Tool dict with %d simple functions", len(simple_funcs))
+                except Exception:
+                    _LOGGER.debug("Failed to add simple function defs; adding as single Tool dict", exc_info=True)
+                    tools_list.append({"function_declarations": simple_funcs})
 
         return tools_list
 
@@ -290,6 +371,17 @@ class GeminiLiveClient:
 
         # Build tools
         tools = self._build_tools()
+
+        # Debug: compact preview of tools to help diagnose connect failures
+        try:
+            if tools:
+                try:
+                    preview = self._preview_tools(tools)
+                    _LOGGER.debug("_build_config: tools preview=%s", preview)
+                except Exception:
+                    _LOGGER.debug("_build_config: failed to generate tools preview", exc_info=True)
+        except Exception:
+            pass
 
         # Build system instruction
         system_instruction = None
@@ -445,6 +537,36 @@ class GeminiLiveClient:
             _LOGGER.error("Failed to connect to Gemini Live API: %s", err_str)
             await self._emit(EVENT_ERROR, {"error": err_str})
 
+            # If connection failed and we have tools configured, try bisecting
+            # to find any problematic tool declarations that may trigger
+            # policy/invalid-frame rejections. Only run once per client
+            # instance to avoid loops.
+            try:
+                if self._session_config.tools and not getattr(self, "_bisect_attempted", False):
+                    self._bisect_attempted = True
+                    _LOGGER.warning("Connect failed; attempting automatic bisect of %d tools to identify problematic declarations", len(self._session_config.tools))
+                    try:
+                        bisect_results = await self.bisect_tools(timeout=15.0)
+                        _LOGGER.info("bisect_tools results: %s", bisect_results)
+                        # Emit results so frontends get actionable info
+                        await self._emit(EVENT_ERROR, {"error": "tool_bisect_results", "results": bisect_results})
+
+                        # Filter out failing tools and retry once if any succeeded
+                        successful = [t for t in (self._session_config.tools or []) if bisect_results.get((t.get("name") or t.get("id") or "<unnamed>"), False)]
+                        if successful:
+                            _LOGGER.warning("Some tools passed bisect; retrying connect with %d tools", len(successful))
+                            self._session_config.tools = successful
+                            return await self.connect()
+                        else:
+                            _LOGGER.warning("No tools passed bisect; disabling tools to allow connection")
+                            # Disable tools to allow at least a basic connection
+                            self._session_config.tools = []
+                            return await self.connect()
+                    except Exception as be:
+                        _LOGGER.debug("Automatic bisect failed: %s", be, exc_info=True)
+            except Exception:
+                pass
+
             # If we attempted to resume a session but the server reports the
             # resumption handle/session is not found (policy violation 1008),
             # clear the handle and retry once without resumption to recover.
@@ -572,11 +694,19 @@ class GeminiLiveClient:
                                                 except Exception:
                                                     _LOGGER.debug("Audio queue put_nowait failed; queue size may be overflowing")
                                                 self._current_response.audio_data += bytes(audio_data)
+                                                # Emit preview + full delta asynchronously. Preview helps diagnosing frame payloads.
+                                                try:
+                                                    preview = base64.b64encode(bytes(audio_data[:32])).decode("utf-8")
+                                                except Exception:
+                                                    preview = "<preview-unavailable>"
                                                 audio_b64 = base64.b64encode(bytes(audio_data)).decode("utf-8")
-                                                # Don't await here to avoid blocking the loop; schedule emission and log it
                                                 try:
                                                     asyncio.create_task(self._emit(EVENT_AUDIO_DELTA, {"audio": audio_b64}))
-                                                    _LOGGER.debug("Scheduled EVENT_AUDIO_DELTA emit: %d bytes", len(audio_data))
+                                                    _LOGGER.debug(
+                                                        "Scheduled EVENT_AUDIO_DELTA emit: %d bytes preview=%s",
+                                                        len(audio_data),
+                                                        preview,
+                                                    )
                                                 except Exception as e:
                                                     _LOGGER.error("Failed to schedule audio_delta emit: %s", e)
                                         except Exception as e:
@@ -770,6 +900,11 @@ class GeminiLiveClient:
 
                     # Handle tool calls
                     if hasattr(response, "tool_call") and response.tool_call:
+                        try:
+                            # Log a truncated raw representation to help debugging tool payloads
+                            _LOGGER.debug("Raw tool_call: %s", str(response.tool_call)[:1000])
+                        except Exception:
+                            pass
                         await self._handle_tool_call(response.tool_call)
 
                     # Handle direct data (fallback for some SDK versions)
@@ -803,6 +938,12 @@ class GeminiLiveClient:
                     else:
                         _LOGGER.info("WebSocket connection closed: %s", error_str)
 
+                    # Include traceback/debug info for closure events
+                    try:
+                        _LOGGER.debug("Receive loop close exception", exc_info=True)
+                    except Exception:
+                        pass
+
                     # Clean up session context and mark disconnected
                     self._connected = False
                     try:
@@ -820,6 +961,11 @@ class GeminiLiveClient:
 
                 # Other unexpected errors - log and emit, may retry briefly if still connected
                 _LOGGER.error("Error in receive loop: %s", e)
+                # Log full traceback for unexpected errors
+                try:
+                    _LOGGER.exception("Receive loop unexpected exception")
+                except Exception:
+                    pass
                 await self._emit(EVENT_ERROR, {"error": error_str})
                 if self._connected:
                     await asyncio.sleep(1.0)
@@ -837,23 +983,138 @@ class GeminiLiveClient:
 
                 _LOGGER.info("Function call: %s with args: %s", name, args)
 
-                # Store pending call
+                # Determine if this function was declared as non-blocking
+                non_blocking = False
+                try:
+                    non_blocking = self._function_behaviors.get(name, "").upper() == "NON_BLOCKING"
+                except Exception:
+                    non_blocking = False
+
+                # Store pending call with behavior metadata
                 self._pending_function_calls[call_id] = {
                     "name": name,
                     "args": args,
+                    "non_blocking": non_blocking,
                 }
+                _LOGGER.debug("Stored pending function call: %s (non_blocking=%s)", call_id, name, args, non_blocking)
 
+                # Emit function call event; include non_blocking flag so callers
+                # can decide whether to run the function asynchronously.
                 await self._emit(
                     EVENT_FUNCTION_CALL,
                     {
                         "call_id": call_id,
                         "name": name,
                         "arguments": args,
+                        "non_blocking": non_blocking,
                     },
                 )
 
         except Exception as e:
             _LOGGER.error("Error handling tool call: %s", e)
+
+    def _sanitize_for_json(self, obj: Any, _depth: int = 0) -> Any:
+        """Recursively convert an object to a JSON-serializable form.
+
+        - bytes/bytearray -> base64 string
+        - dict/list/tuple -> recurse
+        - other non-serializable -> str(value)
+
+        Limits recursion depth to avoid pathological structures.
+        """
+        if _depth > 10:
+            return str(obj)
+
+        # Bytes -> base64 string
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            try:
+                return base64.b64encode(bytes(obj)).decode("utf-8")
+            except Exception:
+                return str(obj)
+
+        # Primitive JSON types
+        if obj is None or isinstance(obj, (bool, int, float, str)):
+            return obj
+
+        # Mapping
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                try:
+                    key = k if isinstance(k, str) else str(k)
+                    out[key] = self._sanitize_for_json(v, _depth + 1)
+                except Exception:
+                    out[str(k)] = str(v)
+            return out
+
+        # Sequence
+        if isinstance(obj, (list, tuple)):
+            return [self._sanitize_for_json(v, _depth + 1) for v in obj]
+
+        # Pydantic models / objects with dict()/json()
+        try:
+            if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+                try:
+                    return self._sanitize_for_json(obj.dict(), _depth + 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Fallback: convert to string
+        try:
+            return str(obj)
+        except Exception:
+            return repr(obj)
+
+    def _preview_tools(self, tools: list[Any]) -> dict[str, Any]:
+        """Create a compact preview summary for tools to keep logs small.
+
+        The preview includes counts and function names and a tiny parameter
+        summary (top-level parameter keys) so we can identify problematic
+        declarations without dumping large schemas.
+        """
+        try:
+            previews: list[dict[str, Any]] = []
+        except Exception:
+            return {"tools": []}
+
+        for t in tools:
+            try:
+                # Support both SDK `types.Tool` objects and plain dict-shaped tool entries
+                if isinstance(t, dict):
+                    fdecls = t.get("function_declarations") or t.get("functions") or []
+                else:
+                    fdecls = getattr(t, "function_declarations", None) or getattr(t, "functions", None) or []
+
+                funcs: list[dict[str, Any]] = []
+                for fd in (fdecls or []):
+                    try:
+                        if isinstance(fd, dict):
+                            name = fd.get("name") or fd.get("id") or "<unnamed>"
+                            params = fd.get("parameters") or fd.get("inputSchema") or fd.get("input_schema") or {}
+                        else:
+                            name = getattr(fd, "name", None) or getattr(fd, "id", None) or "<unnamed>"
+                            params = getattr(fd, "parameters", None) or {}
+
+                        funcs.append({
+                            "name": name,
+                            "parameters": params,
+                        })
+                    except Exception:
+                        funcs.append({"name": "<error>", "parameters": {}})
+
+                # Preserve a clean, realistic shape: return tools as a list of
+                # objects each containing a `functions` list with sanitized
+                # function dicts. Do not invent synthetic `tool_count`/
+                # `function_count` keys — callers expect standard tool shapes.
+                previews.append({
+                    "functions": funcs,
+                })
+            except Exception:
+                previews.append({"error": "preview_failed"})
+
+        return {"tools": previews}
 
     async def send_text(self, text: str, turn_complete: bool = True) -> LiveResponse:
         """Send text message to the API and wait for response.
@@ -874,7 +1135,8 @@ class GeminiLiveClient:
         self._response_futures[self._current_response.id] = response_future
 
         # Send text using send_client_content (official API method)
-        await self._session.send_client_content(
+        send_client_content = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_client_content"))
+        await send_client_content(
             turns={"role": "user", "parts": [{"text": text}]},
             turn_complete=turn_complete
         )
@@ -898,14 +1160,112 @@ class GeminiLiveClient:
         """
         if not self._connected or not self._session:
             return
+        # Validate type
+        if not isinstance(audio_data, (bytes, bytearray, memoryview)):
+            _LOGGER.error("send_audio: audio_data must be bytes-like, got %s", type(audio_data))
+            await self._emit(EVENT_ERROR, {"error": "send_audio: invalid audio_data type"})
+            return
 
-        # Send audio using send_realtime_input (official API method)
-        await self._session.send_realtime_input(
-            audio=types.Blob(
-                data=audio_data,
-                mime_type=f"audio/pcm;rate={sample_rate}"
-            )
+        # Prevent sending empty payloads
+        if len(audio_data) == 0:
+            _LOGGER.debug("send_audio: skipping empty audio payload")
+            return
+
+        # Basic validation: 16-bit PCM should have even byte length
+        if len(audio_data) % 2 != 0:
+            _LOGGER.warning("send_audio: audio payload length is odd (%d) — likely not 16-bit PCM", len(audio_data))
+
+        # Prepare blob and base64 representation
+        blob = types.Blob(
+            data=bytes(audio_data),
+            mime_type=f"audio/pcm;rate={sample_rate}",
         )
+
+        # Prepare base64 dict payload (safer for JSON/text frames)
+        try:
+            audio_b64 = base64.b64encode(bytes(audio_data)).decode("utf-8")
+        except Exception:
+            audio_b64 = None
+
+        # Debug: log a short preview of the payload to help diagnose invalid-frame issues.
+        try:
+            preview_b64 = base64.b64encode(bytes(audio_data[:32])).decode("utf-8")
+        except Exception:
+            preview_b64 = "<preview-unavailable>"
+        _LOGGER.debug(
+            "send_audio: preparing to send audio bytes=%d sample_rate=%s mime=%s preview=%s",
+            len(audio_data),
+            sample_rate,
+            blob.mime_type,
+            preview_b64,
+        )
+
+        try:
+            _LOGGER.debug("send_audio: sending %d bytes", len(audio_data))
+            # Cast the session method to an awaitable callable so static checkers
+            # (Pylance) treat it correctly.
+            send_realtime = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_realtime_input"))
+
+            # Prefer sending as a JSON-friendly dict with base64 data to avoid
+            # websocket text-frame encoding issues observed on some environments.
+            if audio_b64 is not None:
+                try:
+                    await send_realtime(audio={"data": audio_b64, "mime_type": blob.mime_type})
+                    _LOGGER.debug("send_audio: send successful via base64 dict %d bytes", len(audio_data))
+                except Exception:
+                    # Fallback to binary Blob if base64 dict is rejected
+                    _LOGGER.debug("send_audio: base64 dict send failed; falling back to Blob for %d bytes", len(audio_data))
+                    await send_realtime(audio=blob)
+                    _LOGGER.debug("send_audio: send successful via Blob %d bytes", len(audio_data))
+            else:
+                # If base64 conversion failed, send raw blob
+                await send_realtime(audio=blob)
+                _LOGGER.debug("send_audio: send successful via Blob %d bytes", len(audio_data))
+        except Exception as e:
+            err_str = str(e)
+            # Log error summary
+            _LOGGER.error("send_audio: error sending audio (%d bytes): %s", len(audio_data), err_str)
+            # Log full exception repr and traceback for deeper diagnosis
+            try:
+                _LOGGER.debug("send_audio: exception repr=%r type=%s", e, type(e))
+                _LOGGER.exception("send_audio: full exception")
+            except Exception:
+                pass
+            # Emit error to handlers for UI/debug
+            try:
+                await self._emit(EVENT_ERROR, {"error": err_str})
+            except Exception:
+                pass
+
+            # If underlying socket returned an invalid-frame (1007), treat as fatal and tear down session
+            if "1007" in err_str or "invalid frame" in err_str.lower() or "invalid frame payload" in err_str.lower():
+                # Try a safe fallback: some SDK/server combos accept base64-encoded
+                # audio in a text-friendly dict instead of raw bytes.
+                # Only attempt fallback if the session object still exists and is connected.
+                if not self._session or not self._connected:
+                    _LOGGER.debug("send_audio: session closed before fallback could run (session=%s connected=%s)", self._session is None, self._connected)
+                else:
+                    try:
+                        _LOGGER.debug("send_audio: attempting fallback send as base64 text to avoid invalid-frame error")
+                        audio_b64 = base64.b64encode(bytes(audio_data)).decode("utf-8")
+                        # Use a plain dict payload which the SDK may serialize as JSON/text.
+                        send_realtime = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_realtime_input"))
+                        await send_realtime(audio={"data": audio_b64, "mime_type": blob.mime_type})
+                        _LOGGER.info("send_audio: fallback send successful (%d bytes encoded)", len(audio_data))
+                        return
+                    except Exception as fallback_exc:
+                        _LOGGER.warning("send_audio: fallback send failed: %s", fallback_exc)
+                        _LOGGER.warning("send_audio: fatal frame error detected, closing session")
+                        self._connected = False
+                        try:
+                            if self._session_context:
+                                await self._session_context.__aexit__(type(fallback_exc), fallback_exc, getattr(fallback_exc, '__traceback__', None))
+                        except Exception:
+                            _LOGGER.debug("send_audio: error closing session context after frame error", exc_info=True)
+                        self._session = None
+                        self._session_context = None
+            # Re-raise so callers can observe failure if they want
+            raise
 
     async def send_audio_base64(self, audio_b64: str, sample_rate: int = 16000) -> None:
         """Send base64 encoded audio to the API."""
@@ -988,7 +1348,8 @@ class GeminiLiveClient:
             return
 
         try:
-            await self._session.send_realtime_input(audio_stream_end=True)
+            send_realtime = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_realtime_input"))
+            await send_realtime(audio_stream_end=True)
         except Exception as e:
             _LOGGER.debug("Error sending audio stream end: %s", e)
 
@@ -997,7 +1358,8 @@ class GeminiLiveClient:
         if not self._connected or not self._session:
             return
 
-        await self._session.send_realtime_input(
+        send_realtime = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_realtime_input"))
+        await send_realtime(
             media=types.Blob(
                 data=image_data,
                 mime_type=mime_type
@@ -1029,15 +1391,56 @@ class GeminiLiveClient:
             func_info = self._pending_function_calls.pop(call_id, {})
             func_name = func_info.get("name", "")
 
-            # Create function response
+            # Sanitize and validate the result payload to avoid sending
+            # binary or non-serializable types which can trigger invalid
+            # frame errors on the underlying websocket.
+            try:
+                sanitized = self._sanitize_for_json(result)
+            except Exception as e:
+                _LOGGER.error("send_function_result: failed to sanitize result for call_id=%s: %s", call_id, e)
+                await self._emit(EVENT_ERROR, {"error": f"failed to sanitize function result: {e}"})
+                return
+
+            try:
+                dumped = json.dumps(sanitized)
+            except (TypeError, ValueError) as e:
+                _LOGGER.error("send_function_result: sanitized result still not serializable for call_id=%s: %s", call_id, e)
+                await self._emit(EVENT_ERROR, {"error": f"function result not JSON-serializable: {e}"})
+                return
+
+            # Limit payload size to avoid oversized frames (64 KiB)
+            max_size = 64 * 1024
+            byte_len = len(dumped.encode("utf-8"))
+            if byte_len > max_size:
+                _LOGGER.error("send_function_result: sanitized result too large (%d bytes) for call_id=%s", byte_len, call_id)
+                await self._emit(EVENT_ERROR, {"error": "function result too large to send"})
+                return
+
+            # Create function response using the sanitized payload
             function_response = types.FunctionResponse(
                 id=call_id,
                 name=func_name,
-                response=result,
+                response=sanitized,
             )
 
+            # Debug: compact preview of function response payload (avoid dumping full content)
+            try:
+                sample = dumped[:200] if isinstance(dumped, str) else None
+                _LOGGER.debug(
+                    "send_function_result: preview=%s",
+                    {
+                        "call_id": call_id,
+                        "name": func_name,
+                        "response_bytes": byte_len,
+                        "sample": sample,
+                    },
+                )
+            except Exception:
+                pass
+
             # Send the response using send_tool_response (official API method)
-            await self._session.send_tool_response(
+            send_tool = cast(Callable[..., Awaitable[Any]], getattr(self._session, "send_tool_response"))
+            await send_tool(
                 function_responses=[function_response]
             )
             _LOGGER.info("Sent function result for call_id=%s", call_id)
@@ -1060,7 +1463,121 @@ class GeminiLiveClient:
 
     def add_tool(self, tool: dict[str, Any]) -> None:
         """Add a function tool to the session."""
+        _LOGGER.debug("Adding tool: %s", tool)
         self._session_config.tools.append(tool)
+
+    async def bisect_tools(self, timeout: float = 20.0) -> dict[str, bool]:
+        """Test configured tools one-by-one to find problematic declarations.
+
+        This helper will temporarily replace the session tools with a single
+        tool and attempt to `connect()` using the current session config.
+        It records whether the connect succeeded for each tool. The original
+        `self._session_config.tools` list is restored at the end.
+
+        Returns a mapping of tool name -> bool (True if connect succeeded).
+        """
+        results: dict[str, bool] = {}
+
+        orig_tools = list(self._session_config.tools)
+
+        try:
+            for tool in orig_tools:
+                name = tool.get("name") or tool.get("id") or "<unnamed>"
+                _LOGGER.info("bisect_tools: testing tool '%s'", name)
+                # Replace tools with single candidate
+                self._session_config.tools = [tool]
+
+                try:
+                    # Attempt to connect with a timeout
+                    ok = await asyncio.wait_for(self.connect(), timeout=timeout)
+                    if ok:
+                        results[name] = True
+                        # Immediately disconnect to reset server-side state
+                        try:
+                            await self.disconnect()
+                        except Exception:
+                            pass
+                    else:
+                        results[name] = False
+                except Exception as e:
+                    _LOGGER.debug("bisect_tools: connect for tool '%s' failed: %s", name, e, exc_info=True)
+                    results[name] = False
+                    try:
+                        await self.disconnect()
+                    except Exception:
+                        pass
+
+            return results
+        finally:
+            # Restore original tool list regardless of outcome
+            self._session_config.tools = orig_tools
+
+    def _preview_tool_dict(self, tool: dict[str, Any]) -> dict[str, Any]:
+        """Create a small preview from a tool dict (from config) for logging.
+
+        Avoids dumping large parameter schemas but shows enough to identify
+        the tool and top-level parameter keys.
+        """
+        try:
+            name = tool.get("name") or tool.get("id") or tool.get("function_declarations") and "<tool-with-fdecl>" or "<unnamed>"
+        except Exception:
+            name = "<unnamed>"
+
+        out: dict[str, Any] = {"name": name}
+
+        try:
+            if "function_declarations" in tool and isinstance(tool.get("function_declarations"), (list, tuple)):
+                funcs = []
+                for fd in tool.get("function_declarations", [])[:8]:
+                    try:
+                        fn = fd.get("name") if isinstance(fd, dict) else getattr(fd, "name", "<unnamed>")
+                        params = fd.get("parameters") if isinstance(fd, dict) else getattr(fd, "parameters", None)
+                        pkeys = list(params.get("properties", {}).keys())[:8] if isinstance(params, dict) and isinstance(params.get("properties", {}), dict) else []
+                        funcs.append({"name": fn, "param_keys": pkeys})
+                    except Exception:
+                        funcs.append({"name": "<error>", "param_keys": []})
+                out["function_declarations_preview"] = funcs
+            else:
+                # show top-level keys for non-fdecl tool dicts like {'google_search': {}}
+                top_keys = list(tool.keys())[:8]
+                out["keys"] = top_keys
+        except Exception:
+            pass
+
+        return out
+
+    async def bisect_tools_and_report(self, timeout: float = 20.0) -> dict[str, bool]:
+        """Run bisect_tools() then log and emit detailed previews for failing tools.
+
+        Returns the same mapping as `bisect_tools`.
+        """
+        try:
+            results = await self.bisect_tools(timeout=timeout)
+        except Exception as e:
+            _LOGGER.error("bisect_tools_and_report: bisect run failed: %s", e, exc_info=True)
+            await self._emit(EVENT_ERROR, {"error": "bisect_failed", "reason": str(e)})
+            return {}
+
+        # Emit results and detailed previews for failing tools to help debugging
+        try:
+            failing = [name for name, ok in results.items() if not ok]
+            detailed: dict[str, Any] = {"failing": failing, "results": results}
+            # Map failing names back to original tool dicts when possible
+            previews: dict[str, Any] = {}
+            for t in (self._session_config.tools or []):
+                name = t.get("name") or t.get("id") or "<unnamed>"
+                if name in failing:
+                    previews[name] = self._preview_tool_dict(t)
+
+            if previews:
+                detailed["previews"] = previews
+
+            _LOGGER.info("bisect_tools_and_report: detailed results=%s", detailed)
+            await self._emit(EVENT_ERROR, {"error": "tool_bisect_detailed", "details": detailed})
+        except Exception as e:
+            _LOGGER.debug("bisect_tools_and_report: failed to prepare detailed report: %s", e, exc_info=True)
+
+        return results
 
     def get_conversation_history(self) -> list[ConversationItem]:
         """Get the conversation history."""

@@ -381,6 +381,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_stop_listening)
     websocket_api.async_register_command(hass, websocket_get_status)
     websocket_api.async_register_command(hass, websocket_debug_state)
+    websocket_api.async_register_command(hass, websocket_set_resumption)
     websocket_api.async_register_command(hass, websocket_subscribe)
 
     # Start a background debug reporter to log routes/clients periodically
@@ -1099,6 +1100,149 @@ async def websocket_get_status(
         is_speaking = data.get("is_speaking", False)
 
     connection.send_result(msg["id"], {"connected": connected, "is_listening": is_listening, "is_speaking": is_speaking})
+
+
+@websocket_api.websocket_command(
+    {
+        "type": "gemini_live/set_resumption",
+        vol.Optional("entry_id"): str,
+        vol.Optional("client_uuid"): str,
+        vol.Optional("enable"): bool,
+        vol.Optional("clear_handle"): bool,
+    }
+)
+@websocket_api.async_response
+async def websocket_set_resumption(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Enable/disable session resumption and optionally clear stored handle."""
+    data, entry_id = _get_data(hass, msg.get("entry_id"))
+
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Gemini Live Audio not configured")
+        return
+
+    session_config = data.get("session_config")
+    if not session_config:
+        connection.send_error(msg["id"], "not_found", "Session config not available")
+        return
+
+    enable = msg.get("enable")
+    clear = bool(msg.get("clear_handle", False))
+
+    try:
+        if enable is not None:
+            try:
+                session_config.enable_session_resumption = bool(enable)
+            except Exception:
+                pass
+
+        if clear:
+            try:
+                session_config.session_resumption_handle = None
+            except Exception:
+                pass
+
+        connection.send_result(msg["id"], {"ok": True, "enable": getattr(session_config, "enable_session_resumption", None), "handle_cleared": clear})
+    except Exception as e:
+        connection.send_error(msg["id"], "set_failed", str(e))
+
+
+@websocket_api.websocket_command(
+    {
+        "type": "gemini_live/run_bisect",
+        vol.Optional("entry_id"): str,
+        vol.Optional("timeout"): int,
+    }
+)
+@websocket_api.async_response
+async def websocket_run_bisect(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Run bisect on configured tools and per-MCP groups and return results.
+
+    Returns a dict with `flat` (results for flat tools) and `groups`
+    mapping server_name -> per-tool results.
+    """
+    data, entry_id = _get_data(hass, msg.get("entry_id"))
+
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Gemini Live Audio not configured")
+        return
+
+    # Resolve a client (prefer per-connection/legacy)
+    client_obj, _ = _get_client(hass, entry_id)
+    if not client_obj:
+        connection.send_error(msg["id"], "not_connected", "No Gemini client available")
+        return
+
+    timeout = float(msg.get("timeout") or 20.0)
+
+    session_config = data.get("session_config")
+    if not session_config:
+        connection.send_error(msg["id"], "not_found", "Session config not available")
+        return
+
+    results: dict[str, Any] = {"flat": {}, "groups": {}}
+
+    try:
+        # First, run bisect on current flat tools (if any)
+        try:
+            _LOGGER.info("Running bisect on flat tools (timeout=%s)", timeout)
+            flat = await client_obj.bisect_tools_and_report(timeout=timeout)
+            results["flat"] = flat
+        except Exception as e:
+            _LOGGER.debug("Flat bisect failed: %s", e, exc_info=True)
+            results["flat"] = {"error": str(e)}
+
+        # Now run bisect per MCP group (if present)
+        mcp_groups = getattr(session_config, "mcp_tool_groups", {}) or {}
+        orig_tools = list(getattr(session_config, "tools", []) or [])
+
+        for server_name, funcs in list(mcp_groups.items()):
+            try:
+                if not funcs:
+                    results["groups"][server_name] = {"error": "no_functions"}
+                    continue
+
+                # Build simple per-function tool list so bisect_tools tests each function
+                simple_tools: list[dict[str, Any]] = []
+                for f in funcs:
+                    try:
+                        if isinstance(f, dict):
+                            name = f.get("name") or f.get("id") or "<unnamed>"
+                            desc = f.get("description") or (f.get("annotations") or {}).get("title") or ""
+                            params = f.get("parameters") or f.get("inputSchema") or f.get("input_schema") or {}
+                            simple_tools.append({"name": name, "description": desc, "parameters": params})
+                        else:
+                            simple_tools.append({"name": str(f)})
+                    except Exception:
+                        simple_tools.append({"name": "<error>"})
+
+                # Temporarily replace session tools with this group's simple tools
+                session_config.tools = simple_tools
+                _LOGGER.info("Running bisect for MCP group %s (%d funcs)", server_name, len(simple_tools))
+                try:
+                    grp_res = await client_obj.bisect_tools(timeout=timeout)
+                    results["groups"][server_name] = grp_res
+                except Exception as e:
+                    _LOGGER.debug("Bisect for group %s failed: %s", server_name, e, exc_info=True)
+                    results["groups"][server_name] = {"error": str(e)}
+                finally:
+                    # Restore original tools after each group run
+                    session_config.tools = orig_tools
+            except Exception as e:
+                _LOGGER.debug("Error preparing bisect for group %s: %s", server_name, e, exc_info=True)
+                results["groups"][server_name] = {"error": str(e)}
+
+        connection.send_result(msg["id"], {"ok": True, "results": results})
+    except Exception as e:
+        _LOGGER.error("websocket_run_bisect failed: %s", e, exc_info=True)
+        connection.send_error(msg["id"], "bisect_failed", str(e))
 
 
 @websocket_api.websocket_command(

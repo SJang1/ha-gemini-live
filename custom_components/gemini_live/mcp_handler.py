@@ -98,6 +98,8 @@ class MCPTool:
     description: str
     input_schema: dict[str, Any]
     server_name: str
+    # Preserve the original raw tool dict as returned by the MCP server
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -744,6 +746,7 @@ class MCPServerHandler:
                     description=t.get("description", ""),
                     input_schema=t.get("inputSchema", {}),
                     server_name=server.name,
+                    raw=t,
                 )
                 for t in tools
             ]
@@ -942,6 +945,7 @@ class MCPServerHandler:
                         description=t.get("description", ""),
                         input_schema=t.get("inputSchema", {}),
                         server_name=server.name,
+                        raw=t,
                     )
                     for t in tools
                 ]
@@ -1149,6 +1153,41 @@ class MCPServerHandler:
                     "parameters": tool.input_schema,
                 })
         return functions
+
+    def get_tools_grouped_by_server(self) -> dict[str, list[dict[str, Any]]]:
+        """Return tools grouped by MCP server as mapping server_name -> [function defs].
+
+        Each function def matches the shape returned by `get_tools_as_functions()`
+        but the results are scoped to their originating MCP server. This allows
+        callers to create one Tool entry per MCP server when building the
+        LiveConnectConfig instead of flattening all functions into a single
+        oversized list.
+        """
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for server in self._servers.values():
+            if not server.connected:
+                continue
+            # Return the original raw tool dicts as received from the MCP server
+            raw_tools: list[dict[str, Any]] = []
+            for tool in server.tools:
+                try:
+                    # If the server provided the original raw dict, use it unchanged.
+                    if isinstance(tool, dict):
+                        raw_tools.append(tool)
+                    elif isinstance(tool, MCPTool) and isinstance(tool.raw, dict) and tool.raw:
+                        raw_tools.append(tool.raw)
+                    else:
+                        # Fallback: reconstruct from available fields
+                        raw_tools.append({
+                            "name": getattr(tool, "name", ""),
+                            "description": getattr(tool, "description", ""),
+                            "inputSchema": getattr(tool, "input_schema", {}),
+                        })
+                except Exception:
+                    raw_tools.append({"name": getattr(tool, "name", "" )})
+            if raw_tools:
+                grouped[server.name] = raw_tools
+        return grouped
 
     def _make_function_name(self, server_name: str, tool_name: str) -> str:
         """Create a valid function name from server and tool names."""

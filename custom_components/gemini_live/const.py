@@ -25,6 +25,7 @@ CONF_ENABLE_AFFECTIVE_DIALOG: Final = "enable_affective_dialog"
 CONF_ENABLE_PROACTIVE_AUDIO: Final = "enable_proactive_audio"
 CONF_ENABLE_GOOGLE_SEARCH: Final = "enable_google_search"
 CONF_ENABLE_HA_TOOLS: Final = "enable_ha_tools"
+CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION: Final = "enable_context_window_compression"
 CONF_ENABLE_PERSONALIZATION: Final = "enable_personalization"
 CONF_MEDIA_RESOLUTION: Final = "media_resolution"
 

@@ -79,6 +79,8 @@ class GeminiLiveCard extends HTMLElement {
         this._sessionResumable = false;
         this._goAwayWarning = null;
         this._resumptionHandle = null;
+        // UI flag: whether session resumption is disabled by user
+        this._resumptionDisabled = false;
 
         // Connection state
         this._connecting = false;  // True while connection is being established
@@ -1443,6 +1445,12 @@ class GeminiLiveCard extends HTMLElement {
                     micToggle.classList.toggle('active', !this._micEnabled);
                 }
 
+                // Update resumption toggle visual state (active means resumption disabled)
+                const resumptionToggle = this.shadowRoot.getElementById('resumption-toggle');
+                if (resumptionToggle) {
+                    resumptionToggle.classList.toggle('active', !!this._resumptionDisabled);
+                }
+
                 // Update send button disabled state without altering the input
                 const sendBtn = this.shadowRoot.getElementById('send-btn');
                 if (sendBtn) {
@@ -1992,6 +2000,11 @@ class GeminiLiveCard extends HTMLElement {
                     <div class="toggle-switch ${this._muteWhileSpeaking ? 'active' : ''}" id="mute-toggle"></div>
                 </div>
                 
+                <div class="options-row">
+                    <span class="option-label" id="resumption-label">Disable session resumption</span>
+                    <div class="toggle-switch ${this._resumptionDisabled ? 'active' : ''}" id="resumption-toggle"></div>
+                </div>
+                
                 <div class="error-message" id="error-message" style="display: none;"></div>
             </ha-card>
         `;
@@ -2119,6 +2132,38 @@ class GeminiLiveCard extends HTMLElement {
             };
             micToggle.addEventListener('click', toggleMic);
             if (micLabel) micLabel.addEventListener('click', toggleMic);
+        }
+
+        // Resumption toggle - clears stored handle and disables server-side resumption when activated
+        const resumptionToggle = this.shadowRoot.getElementById('resumption-toggle');
+        const resumptionLabel = this.shadowRoot.getElementById('resumption-label');
+        if (resumptionToggle) {
+            const toggleResumption = async () => {
+                this._resumptionDisabled = !this._resumptionDisabled;
+                resumptionToggle.classList.toggle('active', !!this._resumptionDisabled);
+                console.log('Resumption disabled:', this._resumptionDisabled);
+                // If disabling, clear local stored handle and tell backend to clear/disable
+                try {
+                    if (this._resumptionDisabled) {
+                        try { localStorage.removeItem('gemini_live_handle'); } catch (e) {}
+                        const payload = Object.assign({ type: `${DOMAIN}/set_resumption`, enable: false, clear_handle: true }, this._getClientPayload());
+                        logWS('send', 'SET_RESUMPTION', payload);
+                        await this._callWSSafe(payload);
+                        this._addMessage('system', 'Session resumption disabled and handle cleared.');
+                    } else {
+                        const payload = Object.assign({ type: `${DOMAIN}/set_resumption`, enable: true }, this._getClientPayload());
+                        logWS('send', 'SET_RESUMPTION', payload);
+                        await this._callWSSafe(payload);
+                        this._addMessage('system', 'Session resumption enabled.');
+                    }
+                } catch (e) {
+                    console.error('Failed to set resumption:', e);
+                    this._showError('Failed to set session resumption');
+                }
+                this._render();
+            };
+            resumptionToggle.addEventListener('click', toggleResumption);
+            if (resumptionLabel) resumptionLabel.addEventListener('click', toggleResumption);
         }
     }
 

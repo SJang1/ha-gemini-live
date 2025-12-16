@@ -18,6 +18,7 @@ from .const import (
     CONF_API_KEY,
     CONF_ENABLE_AFFECTIVE_DIALOG,
     CONF_ENABLE_GOOGLE_SEARCH,
+    CONF_ENABLE_HA_TOOLS,
     CONF_ENABLE_PROACTIVE_AUDIO,
     CONF_INSTRUCTIONS,
     CONF_MCP_SERVER_ARGS,
@@ -36,6 +37,7 @@ from .const import (
     CONF_TEMPERATURE,
     CONF_VOICE,
     CONF_ENABLE_PERSONALIZATION,
+    CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION,
     DEFAULT_INSTRUCTIONS,
     DEFAULT_MODEL,
     DEFAULT_TEMPERATURE,
@@ -150,6 +152,12 @@ class GeminiLiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     ),
                     vol.Optional(
                         CONF_ENABLE_GOOGLE_SEARCH, default=True
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_ENABLE_HA_TOOLS, default=True
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION, default=True
                     ): selector.BooleanSelector(),
                     vol.Optional(
                         CONF_ENABLE_PERSONALIZATION, default=False
@@ -379,6 +387,8 @@ class GeminiLiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_TEMPERATURE: self._config.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE),
             CONF_ENABLE_PERSONALIZATION: self._config.get(CONF_ENABLE_PERSONALIZATION, False),
             CONF_ENABLE_GOOGLE_SEARCH: self._config.get(CONF_ENABLE_GOOGLE_SEARCH, True),
+            CONF_ENABLE_HA_TOOLS: self._config.get(CONF_ENABLE_HA_TOOLS, True),
+            CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION: self._config.get(CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION, True),
             CONF_ENABLE_AFFECTIVE_DIALOG: self._config.get(CONF_ENABLE_AFFECTIVE_DIALOG, False),
             CONF_ENABLE_PROACTIVE_AUDIO: self._config.get(CONF_ENABLE_PROACTIVE_AUDIO, False),
             CONF_MCP_SERVERS: self._mcp_servers,
@@ -427,6 +437,8 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
                 CONF_INSTRUCTIONS: user_input.get(CONF_INSTRUCTIONS, DEFAULT_INSTRUCTIONS),
                 CONF_TEMPERATURE: user_input.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE),
                 CONF_ENABLE_GOOGLE_SEARCH: user_input.get(CONF_ENABLE_GOOGLE_SEARCH, True),
+                    CONF_ENABLE_HA_TOOLS: user_input.get(CONF_ENABLE_HA_TOOLS, True),
+                    CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION: user_input.get(CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION, True),
                 CONF_ENABLE_PERSONALIZATION: user_input.get(CONF_ENABLE_PERSONALIZATION, False),
                 CONF_ENABLE_AFFECTIVE_DIALOG: user_input.get(CONF_ENABLE_AFFECTIVE_DIALOG, False),
                 CONF_ENABLE_PROACTIVE_AUDIO: user_input.get(CONF_ENABLE_PROACTIVE_AUDIO, False),
@@ -491,6 +503,14 @@ class GeminiLiveOptionsFlow(config_entries.OptionsFlow):
                     vol.Optional(
                         CONF_ENABLE_PROACTIVE_AUDIO,
                         default=current_config.get(CONF_ENABLE_PROACTIVE_AUDIO, False),
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_ENABLE_HA_TOOLS,
+                        default=current_config.get(CONF_ENABLE_HA_TOOLS, True),
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION,
+                        default=current_config.get(CONF_ENABLE_CONTEXT_WINDOW_COMPRESSION, True),
                     ): selector.BooleanSelector(),
                 }
             ),
