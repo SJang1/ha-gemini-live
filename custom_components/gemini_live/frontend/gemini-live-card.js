@@ -122,6 +122,8 @@ class GeminiLiveCard extends HTMLElement {
         // Bind cleanup handlers
         this._handleBeforeUnload = this._handleBeforeUnload.bind(this);
         this._handleVisibilityChange = this._handleVisibilityChange.bind(this);
+        // When set, suppress automatic reconnect attempts (used during go_away/error)
+        this._suppressAutoReconnect = false;
     }
 
     set hass(hass) {
@@ -218,6 +220,11 @@ class GeminiLiveCard extends HTMLElement {
         this._cleanupSubscription();
         this._stopRecording();
         this._cleanupPlaybackAudio();
+
+        // Clear any go-away warning state
+        try {
+            this._goAwayWarning = null;
+        } catch (e) { }
 
         // Auto-disconnect from API
         this._forceDisconnect();
@@ -543,12 +550,21 @@ class GeminiLiveCard extends HTMLElement {
     _handleError(data) {
         console.error("Gemini Live error:", data);
         logWS('recv', 'ERROR_HANDLED', data);
-        this._addMessage("system", `Error: ${data.message || data.error || "Unknown error"}`);
-        this._render();
+        // Suppress automatic reconnect attempts when an error is received
+        try { this._suppressAutoReconnect = true; } catch (e) {}
+        // Treat certain errors as terminal - perform cleanup
+        const msg = `Error: ${data.message || data.error || "Unknown error"}`;
+        this._terminateConnectionCleanup(msg);
     }
 
     _handleSessionResumed(data) {
         logWS('recv', 'SESSION_RESUMED_HANDLED', data);
+        // Clear any pending go-away countdown when session resumes
+        try {
+            this._goAwayWarning = null;
+        } catch (e) { }
+        // Resume allowing auto-reconnect now that session resumed
+        try { this._suppressAutoReconnect = false; } catch (e) {}
         this._connected = true;
         this._addMessage("system", "Session resumed successfully");
         this._render();
@@ -568,16 +584,22 @@ class GeminiLiveCard extends HTMLElement {
 
     _handleGoAway(data) {
         logWS('recv', 'GO_AWAY_HANDLED', data);
-        this._goAwayWarning = data.time_left;
-        this._addMessage("system", `Warning: Connection will terminate in ${data.time_left || "unknown"} seconds. Save your work.`);
-        this._render();
+        // Suppress automatic reconnect attempts while go_away warning is active
+        try { this._suppressAutoReconnect = true; } catch (e) {}
+        // Show live countdown warning only when the server indicates the
+        // notice originates from the Google API backend. The server may send
+        // go_away events for other reasons; only display the user-facing
+        // "Warning: Connection will terminate..." message when
+        // `from_google_api` is true. Always handle immediate termination.
+        const fromGoogle = !!data.from_google_api;
+        const timeLeft = typeof data.time_left === 'number' ? Math.max(0, Math.floor(data.time_left)) : data.time_left;
+        this._goAwayWarning = timeLeft;
 
-        // Auto-reconnect after termination if we have a resumption handle
-        if (data.time_left && this._resumptionHandle) {
-            setTimeout(() => {
-                this._reconnectWithHandle();
-            }, (data.time_left + 2) * 1000); // Wait a bit after termination
-        }
+        if (fromGoogle) {
+            // Only show the top banner and system message for Google-originated warnings
+            this._addMessage("system", `Warning: Connection will terminate in ${data.time_left || "unknown"} seconds. Save your work.`);
+            this._render();
+        } 
     }
 
     _handleGenerationComplete(data) {
@@ -1006,6 +1028,35 @@ class GeminiLiveCard extends HTMLElement {
         }
     }
 
+    // Centralized cleanup to run whenever the connection is considered terminated.
+    // Stops recording/playback, clears listening state and pending operations,
+    // and updates the UI with an optional reason message.
+    _terminateConnectionCleanup(reason) {
+        console.debug('Terminating connection cleanup', { reason });
+        try { this._stopRecording(); } catch (e) { /* ignore */ }
+        try { this._stopAudioPlayback(); } catch (e) { /* ignore */ }
+        try { this._cleanupPlaybackAudio(); } catch (e) { /* ignore */ }
+        try { this._cleanupSubscription(); } catch (e) { /* ignore */ }
+
+        // Reset flags
+        this._connected = false;
+        this._listening = false;
+        this._pendingListen = false;
+        this._connecting = false;
+
+        // Reset reconnect state so attempts can be made again later if appropriate
+        this._reconnectInProgress = false;
+        this._reconnectAttempts = 0;
+
+        // Optionally notify user
+        if (reason) {
+            try { this._addMessage('system', reason); } catch (e) { /* ignore */ }
+        }
+
+        // Ensure UI updates
+        try { this._render(); } catch (e) { /* ignore */ }
+    }
+
     _floatTo16BitPCM(float32Array) {
         const buffer = new ArrayBuffer(float32Array.length * 2);
         const view = new DataView(buffer);
@@ -1055,6 +1106,10 @@ class GeminiLiveCard extends HTMLElement {
         }
     }
     async _attemptReconnect() {
+        if (this._suppressAutoReconnect) {
+            logWS('recv', 'RECONNECT_SUPPRESSED', {});
+            return;
+        }
         // Do not run multiple concurrent reconnect loops
         if (this._reconnectInProgress) return;
         this._reconnectInProgress = true;
@@ -1092,15 +1147,12 @@ class GeminiLiveCard extends HTMLElement {
     }
 
     _handleSendFailure(e) {
-        // If server closed or deadline expired, mark disconnected and note drops
-        this._connected = false;
-        this._listening = false;
+        // If server closed or deadline expired, perform centralized cleanup
         this._droppedAudioCount += 1;
-        // Start reconnect attempts
-        this._attemptReconnect();
-        // Notify user in UI
-        this._addMessage("system", `Failed to send audio: ${e && e.message ? e.message : 'unknown error'}`);
-        this._render();
+        const msg = `Failed to send audio: ${e && e.message ? e.message : 'unknown error'}`;
+        this._terminateConnectionCleanup(msg);
+        // After cleanup, let reconnect logic run if allowed
+        try { this._attemptReconnect(); } catch (err) { /* ignore */ }
     }
 
     async _sendText(text) {
@@ -1396,6 +1448,38 @@ class GeminiLiveCard extends HTMLElement {
                 if (sendBtn) {
                     sendBtn.disabled = !this._connected;
                 }
+
+                // Ensure the top go-away banner matches current server state
+                // try {
+                //     const existingWarning = this.shadowRoot.querySelector('.go-away-warning');
+                //     if (this._goAwayWarning) {
+                //         const text = `⚠️ Connection terminating in ${this._goAwayWarning}s`;
+                //         if (existingWarning) {
+                //             existingWarning.textContent = text;
+                //         } else {
+                //             const warningDiv = document.createElement('div');
+                //             warningDiv.className = 'go-away-warning';
+                //             warningDiv.textContent = text;
+                //             // Insert the warning immediately after the header inside ha-card
+                //             const haCard = this.shadowRoot.querySelector('ha-card');
+                //             if (haCard) {
+                //                 const header = haCard.querySelector('.header');
+                //                 if (header && header.parentNode) {
+                //                     header.parentNode.insertBefore(warningDiv, header.nextSibling);
+                //                 } else {
+                //                     haCard.insertBefore(warningDiv, haCard.firstChild);
+                //                 }
+                //             } else {
+                //                 // Fallback: insert at top of shadowRoot
+                //                 this.shadowRoot.insertBefore(warningDiv, this.shadowRoot.firstChild);
+                //             }
+                //         }
+                //     } else if (existingWarning) {
+                //         existingWarning.remove();
+                //     }
+                // } catch (err) {
+                //     // ignore DOM update failures during partial render
+                // }
 
                 // Scroll chat to bottom after updates
                 this._scrollChatToBottom();
