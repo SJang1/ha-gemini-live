@@ -1450,36 +1450,36 @@ class GeminiLiveCard extends HTMLElement {
                 }
 
                 // Ensure the top go-away banner matches current server state
-                // try {
-                //     const existingWarning = this.shadowRoot.querySelector('.go-away-warning');
-                //     if (this._goAwayWarning) {
-                //         const text = `⚠️ Connection terminating in ${this._goAwayWarning}s`;
-                //         if (existingWarning) {
-                //             existingWarning.textContent = text;
-                //         } else {
-                //             const warningDiv = document.createElement('div');
-                //             warningDiv.className = 'go-away-warning';
-                //             warningDiv.textContent = text;
-                //             // Insert the warning immediately after the header inside ha-card
-                //             const haCard = this.shadowRoot.querySelector('ha-card');
-                //             if (haCard) {
-                //                 const header = haCard.querySelector('.header');
-                //                 if (header && header.parentNode) {
-                //                     header.parentNode.insertBefore(warningDiv, header.nextSibling);
-                //                 } else {
-                //                     haCard.insertBefore(warningDiv, haCard.firstChild);
-                //                 }
-                //             } else {
-                //                 // Fallback: insert at top of shadowRoot
-                //                 this.shadowRoot.insertBefore(warningDiv, this.shadowRoot.firstChild);
-                //             }
-                //         }
-                //     } else if (existingWarning) {
-                //         existingWarning.remove();
-                //     }
-                // } catch (err) {
-                //     // ignore DOM update failures during partial render
-                // }
+                try {
+                    const existingWarning = this.shadowRoot.querySelector('.go-away-warning');
+                    if (this._goAwayWarning) {
+                        const text = `⚠️ Connection terminating in ${this._goAwayWarning}${this._goAwayWarning > 1 ? "s" : ""}`;
+                        if (existingWarning) {
+                            existingWarning.textContent = text;
+                        } else {
+                            const warningDiv = document.createElement('div');
+                            warningDiv.className = 'go-away-warning';
+                            warningDiv.textContent = text;
+                            // Insert the warning immediately after the header inside ha-card
+                            const haCard = this.shadowRoot.querySelector('ha-card');
+                            if (haCard) {
+                                const header = haCard.querySelector('.header');
+                                if (header && header.parentNode) {
+                                    header.parentNode.insertBefore(warningDiv, header.nextSibling);
+                                } else {
+                                    haCard.insertBefore(warningDiv, haCard.firstChild);
+                                }
+                            } else {
+                                // Fallback: insert at top of shadowRoot
+                                this.shadowRoot.insertBefore(warningDiv, this.shadowRoot.firstChild);
+                            }
+                        }
+                    } else if (existingWarning) {
+                        existingWarning.remove();
+                    }
+                } catch (err) {
+                    // ignore DOM update failures during partial render
+                }
 
                 // Scroll chat to bottom after updates
                 this._scrollChatToBottom();

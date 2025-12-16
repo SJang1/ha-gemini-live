@@ -8,5 +8,5 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/SJang1/ha-gemini-live/issues",
   "requirements": ["google-genai>=1.0.0"],
-  "version": "2.0.5"
+  "version": "2.0.6"
 }
