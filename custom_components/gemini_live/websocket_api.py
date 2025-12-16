@@ -566,6 +566,58 @@ async def websocket_connect(
             arguments = event_data.get("arguments", {})
             
             _LOGGER.info("Handling function call: %s (call_id=%s)", function_name, call_id)
+            # Debug: enumerate available function names from various sources
+            try:
+                available_names = set()
+                # HA builtins
+                try:
+                    if ha_tools:
+                        for t in ha_tools.get_builtin_tools():
+                            if isinstance(t, dict) and t.get("name"):
+                                available_names.add(t.get("name"))
+                except Exception:
+                    pass
+
+                # MCP-provided flat functions
+                try:
+                    if mcp_handler:
+                        for t in mcp_handler.get_tools_as_functions():
+                            if isinstance(t, dict) and t.get("name"):
+                                available_names.add(t.get("name"))
+                except Exception:
+                    pass
+
+                # Session-configured tools (can include dict-shaped Tool entries)
+                try:
+                    sc = data.get("session_config") if isinstance(data, dict) else None
+                    tools_list = getattr(sc, "tools", []) if sc is not None else []
+                    for t in tools_list or []:
+                        if isinstance(t, dict):
+                            # Tool dict may contain 'function_declarations' list
+                            fdecls = t.get("function_declarations") or []
+                            if fdecls:
+                                for fd in fdecls:
+                                    if isinstance(fd, dict) and fd.get("name"):
+                                        available_names.add(fd.get("name"))
+                            elif t.get("name"):
+                                available_names.add(t.get("name"))
+                        elif isinstance(t, str):
+                            available_names.add(t)
+                except Exception:
+                    pass
+
+                # Client raw declarations (if present)
+                try:
+                    if client is not None and hasattr(client, "_raw_function_declarations"):
+                        for k in getattr(client, "_raw_function_declarations", {}).keys():
+                            if k:
+                                available_names.add(k)
+                except Exception:
+                    pass
+
+                _LOGGER.debug("Available function names at call time: %s", sorted([n for n in available_names if n]))
+            except Exception:
+                _LOGGER.debug("Failed to enumerate available functions for debug")
             
             result = None
             
@@ -579,7 +631,23 @@ async def websocket_connect(
                     server_name, tool_name = parsed
                     _LOGGER.info("Calling MCP tool: %s/%s", server_name, tool_name)
                     result = await mcp_handler.call_tool(server_name, tool_name, arguments)
-            
+
+            # If still unknown, try using the conversation agent's executor
+            # (reuses agent logic to handle flat tools and any additional
+            # executors it may provide). This allows flat function defs
+            # (e.g., GitHub-like tools) configured in session/tools to be
+            # resolved by the agent if it knows how to execute them.
+            if result is None:
+                try:
+                    agent = data.get("agent")
+                    if agent and hasattr(agent, "_execute_function"):
+                        try:
+                            result = await agent._execute_function(function_name, call_id, arguments)
+                        except Exception:
+                            result = None
+                except Exception:
+                    result = None
+
             if result is None:
                 result = {"error": f"Unknown function: {function_name}"}
             

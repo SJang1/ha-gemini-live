@@ -133,6 +133,8 @@ class GeminiLiveClient:
         self._pending_function_calls: dict[str, dict[str, Any]] = {}
         # Mapping of function name -> behavior (e.g., 'NON_BLOCKING') from session config
         self._function_behaviors: dict[str, str] = {}
+        # Preserve original/raw declarations (name -> original dict)
+        self._raw_function_declarations: dict[str, dict[str, Any]] = {}
 
         # Current response tracking
         self._current_response: LiveResponse | None = None
@@ -255,18 +257,105 @@ class GeminiLiveClient:
                         return {"name": str(f)}
                     name = f.get("name") or f.get("id") or ""
                     desc = f.get("description") or (f.get("annotations") or {}).get("title") or ""
+                    desc += str(f)
                     params = f.get("parameters") or f.get("inputSchema") or f.get("input_schema") or {}
+                    # Ensure parameters is a dict with properties we can augment
+
+                    _LOGGER.debug("Sanitizing function dict for %s: name=%s desc=%s", server_name, name, desc)
+                    
+                    try:
+                        if not isinstance(params, dict):
+                            params = {}
+                    except Exception:
+                        params = {}
+
+                    if not isinstance(params.get("properties"), dict):
+                        params.setdefault("properties", {})
+
+                    # Only inject a `name` property/required for Home Assistant-style
+                    # tools. Many third-party tools (e.g. music, generic helpers)
+                    # should not be forced to accept a `name` parameter.
+                    try:
+                        fn_name = (f.get("name") or f.get("id") or "") if isinstance(f, dict) else ""
+                    except Exception:
+                        fn_name = ""
+
+                    try:
+                        props = params.get("properties") if isinstance(params, dict) else None
+                        is_ha_like = False
+                        if isinstance(fn_name, str) and fn_name.startswith(("Hass", "hass")):
+                            is_ha_like = True
+                        if isinstance(props, dict):
+                            ha_keys = ("domain", "device_class", "area", "floor", "is_volume_muted")
+                            if any(k in props for k in ha_keys):
+                                is_ha_like = True
+
+                        if is_ha_like:
+                            # Ensure a `name` property exists so callers can target entities
+                            try:
+                                if not isinstance(props, dict):
+                                    params["properties"] = {"name": {"type": "string"}}
+                                else:
+                                    if "name" not in params["properties"]:
+                                        params["properties"]["name"] = {"type": "string"}
+                            except Exception:
+                                try:
+                                    params["properties"] = {"name": {"type": "string"}}
+                                except Exception:
+                                    pass
+
+                            # Ensure `required` includes `name` so callers supply an entity id
+                            try:
+                                req = params.get("required")
+                                if not isinstance(req, list):
+                                    params["required"] = []
+                                if "name" not in params["required"]:
+                                    params["required"].append("name")
+                            except Exception:
+                                try:
+                                    params["required"] = ["name"]
+                                except Exception:
+                                    pass
+                    
+                    except Exception:
+                        # Safe fallback if HA-detection or schema mutation fails
+                        pass
+
                     return {"name": name, "description": desc, "parameters": params}
 
-                # Batch raw function dicts into sanitized tool dicts
+                # Preserve the full function list for each MCP server as a
+                # single tool entry so the Live API sees all available
+                # functions instead of splitting them into multiple tool
+                # declarations. Some MCP servers expect the whole set to
+                # be present together. Do NOT sanitize or alter the raw
+                # dicts received from MCP servers; append them as-is.
                 try:
-                    # Preserve the full function list for each MCP server as a
-                    # single tool entry so the Live API sees all available
-                    # functions instead of splitting them into multiple tool
-                    # declarations. Some MCP servers expect the whole set to
-                    # be present together.
+                    # Sanitize MCP-provided function dicts to the minimal
+                    # shape accepted by the SDK so pydantic validation does
+                    # not reject extra fields like `annotations` or
+                    # vendor-specific keys.
                     sanitized = [_sanitize_fn_dict(f) for f in funcs]
                     tools_list.append({"function_declarations": sanitized})
+                    # Populate function_behaviors mapping if any functions
+                    # declare a non-default behavior (e.g. NON_BLOCKING).
+                    for orig in funcs:
+                        try:
+                            if isinstance(orig, dict):
+                                name = orig.get("name") or orig.get("id") or ""
+                                behavior = orig.get("behavior") or (orig.get("annotations") or {}).get("behavior")
+                                if name and behavior:
+                                    try:
+                                        self._function_behaviors[name] = str(behavior)
+                                    except Exception:
+                                        pass
+                                # Store the original raw declaration for later use (logging, inspection)
+                                try:
+                                    if name:
+                                        self._raw_function_declarations[name] = orig
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                     _LOGGER.debug("Added sanitized Tool dict for server %s with %d functions", server_name, len(sanitized))
                 except Exception:
                     _LOGGER.debug("Failed to add MCP tool group for %s; skipping", server_name, exc_info=True)
@@ -291,8 +380,37 @@ class GeminiLiveClient:
                     # dict through unchanged.
                     if isinstance(tool.get("function_declarations"), (list, tuple)):
                         fdecls = tool.get("function_declarations") or []
-                        tools_list.append(tool)
-                        _LOGGER.debug("Added raw Tool dict from flat tools with %d functions", len(fdecls))
+                        try:
+                            # Sanitize each declared function to avoid passing
+                            # vendor-specific keys (annotations, inputSchema, etc.)
+                            sanitized_fdecls = []
+                            for fd in fdecls:
+                                try:
+                                    if isinstance(fd, dict):
+                                        sanitized = _sanitize_fn_dict(fd)
+                                        sanitized_fdecls.append(sanitized)
+                                        # capture behavior if present
+                                        beh = fd.get("behavior") or (fd.get("annotations") or {}).get("behavior")
+                                        name_fd = fd.get("name") or fd.get("id") or ""
+                                        if name_fd and isinstance(beh, str):
+                                            self._function_behaviors[name_fd] = beh
+                                        # store original raw function declaration
+                                        try:
+                                            if name_fd:
+                                                self._raw_function_declarations[name_fd] = fd
+                                        except Exception:
+                                            pass
+                                    else:
+                                        sanitized_fdecls.append({"name": str(fd)})
+                                except Exception:
+                                    try:
+                                        sanitized_fdecls.append({"name": "<error>"})
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            sanitized_fdecls = list(fdecls)
+                        tools_list.append({"function_declarations": sanitized_fdecls})
+                        _LOGGER.debug("Added sanitized Tool dict from flat tools with %d functions", len(sanitized_fdecls))
                     else:
                         tools_list.append(tool)
                     continue
@@ -307,8 +425,29 @@ class GeminiLiveClient:
             # tool entry so all functions are visible to the Live API.
             if simple_funcs:
                 try:
-                    tools_list.append({"function_declarations": simple_funcs})
-                    _LOGGER.debug("Added raw Tool dict with %d simple functions", len(simple_funcs))
+                    # Sanitize and capture behaviors from simple function defs
+                    sanitized_simple = []
+                    for fd in simple_funcs:
+                        try:
+                            if isinstance(fd, dict):
+                                sanitized = _sanitize_fn_dict(fd)
+                                sanitized_simple.append(sanitized)
+                                beh = fd.get("behavior") or (fd.get("annotations") or {}).get("behavior")
+                                name_fd = fd.get("name") or fd.get("id") or ""
+                                if name_fd and isinstance(beh, str):
+                                    self._function_behaviors[name_fd] = beh
+                                try:
+                                    if name_fd:
+                                        self._raw_function_declarations[name_fd] = fd
+                                except Exception:
+                                    pass
+                            else:
+                                sanitized_simple.append({"name": str(fd)})
+                        except Exception:
+                            sanitized_simple.append({"name": "<error>"})
+
+                    tools_list.append({"function_declarations": sanitized_simple})
+                    _LOGGER.debug("Added sanitized Tool dict with %d simple functions", len(sanitized_simple))
                 except Exception:
                     _LOGGER.debug("Failed to add simple function defs; adding as single Tool dict", exc_info=True)
                     tools_list.append({"function_declarations": simple_funcs})
@@ -996,19 +1135,26 @@ class GeminiLiveClient:
                     "args": args,
                     "non_blocking": non_blocking,
                 }
-                _LOGGER.debug("Stored pending function call: %s (non_blocking=%s)", call_id, name, args, non_blocking)
+                _LOGGER.debug(
+                    "Stored pending function call: id=%s name=%s args=%s non_blocking=%s",
+                    call_id,
+                    name,
+                    args,
+                    non_blocking,
+                )
+
 
                 # Emit function call event; include non_blocking flag so callers
-                # can decide whether to run the function asynchronously.
-                await self._emit(
-                    EVENT_FUNCTION_CALL,
-                    {
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": args,
-                        "non_blocking": non_blocking,
-                    },
-                )
+                # can decide whether to run the function asynchronously. Include
+                # a sanitized preview of the original raw declaration when available.
+                event_payload = {
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": args,
+                    "non_blocking": non_blocking,
+                }
+                
+                await self._emit(EVENT_FUNCTION_CALL, event_payload)
 
         except Exception as e:
             _LOGGER.error("Error handling tool call: %s", e)
@@ -1096,7 +1242,7 @@ class GeminiLiveClient:
                         else:
                             name = getattr(fd, "name", None) or getattr(fd, "id", None) or "<unnamed>"
                             params = getattr(fd, "parameters", None) or {}
-
+                            
                         funcs.append({
                             "name": name,
                             "parameters": params,

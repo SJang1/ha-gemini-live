@@ -610,7 +610,7 @@ class MCPServerHandler:
                             status = resp.status
                             ctype = resp.headers.get("Content-Type", "")
                             text = await resp.text()
-                            _LOGGER.debug("Tools fetch resp status=%s content-type=%s body=%s", status, ctype, text[:1000])
+                            _LOGGER.debug("Tools fetch resp status=%s content-type=%s body=%s", status, ctype, text)
                             if resp.status != 200:
                                 # If unauthorized, try alternate host for this POST
                                 if resp.status == 401:
@@ -1172,17 +1172,67 @@ class MCPServerHandler:
             for tool in server.tools:
                 try:
                     # If the server provided the original raw dict, use it unchanged.
+                    # Normalize raw dicts so callers can rely on a `parameters`
+                    # key (the shape expected by Google/GenAI SDK). Preserve
+                    # original keys but add `parameters` when `inputSchema`
+                    # or `input_schema` exists.
+                    raw_candidate: dict[str, Any]
                     if isinstance(tool, dict):
-                        raw_tools.append(tool)
+                        raw_candidate = dict(tool)
                     elif isinstance(tool, MCPTool) and isinstance(tool.raw, dict) and tool.raw:
-                        raw_tools.append(tool.raw)
+                        raw_candidate = dict(tool.raw)
                     else:
                         # Fallback: reconstruct from available fields
-                        raw_tools.append({
+                        raw_candidate = {
                             "name": getattr(tool, "name", ""),
                             "description": getattr(tool, "description", ""),
                             "inputSchema": getattr(tool, "input_schema", {}),
-                        })
+                        }
+
+                    # If vendor provided input schema under any common key,
+                    # mirror it onto `parameters` so downstream callers don't
+                    # need to special-case `inputSchema` vs `parameters`.
+                    try:
+                        if "parameters" not in raw_candidate:
+                            if "inputSchema" in raw_candidate and isinstance(raw_candidate["inputSchema"], dict):
+                                raw_candidate["parameters"] = raw_candidate["inputSchema"]
+                            elif "input_schema" in raw_candidate and isinstance(raw_candidate["input_schema"], dict):
+                                raw_candidate["parameters"] = raw_candidate["input_schema"]
+                            elif "inputschema" in raw_candidate and isinstance(raw_candidate["inputschema"], dict):
+                                raw_candidate["parameters"] = raw_candidate["inputschema"]
+                    except Exception:
+                        pass
+
+                    # Keep only a truncated preview in `description` and
+                    # attach the full original tool dict under `raw_declaration`.
+                    try:
+                        # Preserve the original before we mutate description
+                        original_raw = dict(raw_candidate)
+                    except Exception:
+                        original_raw = raw_candidate
+
+                    try:
+                        preview = json.dumps(original_raw, ensure_ascii=False)
+                        if len(preview) > 400:
+                            preview = preview[:400] + "..."
+                        existing = raw_candidate.get("description") or ""
+                        if preview:
+                            if existing:
+                                raw_candidate["description"] = f"{existing} [raw_preview: {preview}]"
+                            else:
+                                raw_candidate["description"] = f"[raw_preview: {preview}]"
+                    except Exception:
+                        pass
+
+                    try:
+                        # Attach the full raw declaration separately to avoid
+                        # putting large blobs into `description` while still
+                        # exposing the complete dict for auditing/inspection.
+                        raw_candidate["raw_declaration"] = original_raw
+                    except Exception:
+                        pass
+
+                    raw_tools.append(raw_candidate)
                 except Exception:
                     raw_tools.append({"name": getattr(tool, "name", "" )})
             if raw_tools:

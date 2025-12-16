@@ -226,6 +226,30 @@ Always confirm actions you take and provide helpful feedback.
                 _LOGGER.info("Calling MCP tool: %s/%s", server_name, tool_name)
                 return await self._mcp_handler.call_tool(server_name, tool_name, arguments)
 
+        # If function_name is a flat tool (no server prefix), try to find it
+        # among connected MCP servers' tools and call it on the originating
+        # server. This handles tools that were included as flat function
+        # declarations (e.g., from some MCP handlers) where the model emits
+        # the bare name instead of server__tool.
+        try:
+            if self._mcp_handler:
+                for server in self._mcp_handler.get_all_servers():
+                    try:
+                        for tool in getattr(server, "tools", []) or []:
+                            # tool may be MCPTool or raw dict
+                            tname = None
+                            if hasattr(tool, "name"):
+                                tname = getattr(tool, "name")
+                            elif isinstance(tool, dict):
+                                tname = tool.get("name") or tool.get("id")
+                            if tname and tname == function_name:
+                                _LOGGER.info("Calling flat MCP tool %s on server %s", function_name, server.name)
+                                return await self._mcp_handler.call_tool(server.name, tname, arguments)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
         return {"error": f"Unknown function: {function_name}"}
 
     async def async_process(
