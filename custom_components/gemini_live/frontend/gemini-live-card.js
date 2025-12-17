@@ -127,9 +127,8 @@ class GeminiLiveCard extends HTMLElement {
         // When set, suppress automatic reconnect attempts (used during go_away/error)
         this._suppressAutoReconnect = false;
 
-        // Default behavior: do not resume prior sessions unless user explicitly enables it.
-        // Clear any cached resumption handle on startup so auto-resume never happens by default.
-        this._clearResumptionHandle("init");
+        // Default behavior: do not resume prior sessions unless the user explicitly enables it.
+        // The actual clearing happens after we subscribe (when hass is ready).
     }
 
     set hass(hass) {
@@ -317,6 +316,7 @@ class GeminiLiveCard extends HTMLElement {
                 payload
             );
             logWS('recv', 'SUBSCRIBED', { success: true });
+            this._clearResumptionHandle("init");
         } catch (e) {
             console.error("Failed to subscribe to Gemini Live events:", e);
             logWS('recv', 'SUBSCRIBE_ERROR', { error: e.message });
@@ -330,12 +330,27 @@ class GeminiLiveCard extends HTMLElement {
         }
     }
 
-    _clearResumptionHandle(reason = "manual") {
+    _clearResumptionHandle(reason = "manual", notifyServer = true) {
         try {
             localStorage.removeItem('gemini_live_handle');
         } catch (e) { /* ignore */ }
+        // Also clear stale client_uuid to prevent "Client not found" errors on fresh connect
+        try {
+            localStorage.removeItem('gemini_live_client_uuid');
+        } catch (e) { /* ignore */ }
         this._resumptionHandle = null;
         this._sessionResumable = false;
+        this._clientUuid = null;
+
+        // Optionally inform the backend; fire-and-forget to keep this sync-safe (constructor uses it).
+        if (notifyServer && this._hass) {
+            try {
+                const payload = Object.assign({ type: `${DOMAIN}/set_resumption`, enable: false, clear_handle: true }, this._getClientPayload());
+                logWS('send', 'SET_RESUMPTION', payload);
+                this._callWSSafe(payload).catch((err) => console.debug('SET_RESUMPTION_CLEAR_FAIL', err && err.message));
+            } catch (e) { /* ignore */ }
+        }
+
         if (DEBUG_LOG) {
             console.debug('RESUMPTION_HANDLE_CLEARED', { reason });
         }
@@ -1060,12 +1075,14 @@ class GeminiLiveCard extends HTMLElement {
     // Centralized cleanup to run whenever the connection is considered terminated.
     // Stops recording/playback, clears listening state and pending operations,
     // and updates the UI with an optional reason message.
+    // NOTE: Does NOT cleanup subscription - that would orphan reconnect attempts.
     _terminateConnectionCleanup(reason) {
         console.debug('Terminating connection cleanup', { reason });
         try { this._stopRecording(); } catch (e) { /* ignore */ }
         try { this._stopAudioPlayback(); } catch (e) { /* ignore */ }
         try { this._cleanupPlaybackAudio(); } catch (e) { /* ignore */ }
-        try { this._cleanupSubscription(); } catch (e) { /* ignore */ }
+        // Do NOT cleanup subscription here - it breaks subsequent connect/listen
+        // The subscription should only be cleaned up in disconnectedCallback
 
         // Reset flags
         this._connected = false;
