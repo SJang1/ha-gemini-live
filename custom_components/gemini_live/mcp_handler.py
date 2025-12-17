@@ -1535,12 +1535,16 @@ class HomeAssistantMCPTools:
         self._hass = hass
 
     def get_builtin_tools(self) -> list[dict[str, Any]]:
-        """Get built-in HA tools as function definitions."""
+        """Get built-in HA tools as function definitions.
+        
+        Returns tools in MCP-compatible format with inputSchema (not parameters)
+        to match what Google's Pydantic model expects.
+        """
         return [
             {
                 "name": "get_entity_state",
                 "description": "Get the current state of a Home Assistant entity",
-                "parameters": {
+                "inputSchema": {
                     "type": "object",
                     "properties": {
                         "entity_id": {
@@ -1554,7 +1558,7 @@ class HomeAssistantMCPTools:
             {
                 "name": "call_service",
                 "description": "Call a Home Assistant service to control devices",
-                "parameters": {
+                "inputSchema": {
                     "type": "object",
                     "properties": {
                         "domain": {
@@ -1590,7 +1594,7 @@ class HomeAssistantMCPTools:
             {
                 "name": "get_entities_by_domain",
                 "description": "List all entities in a specific domain",
-                "parameters": {
+                "inputSchema": {
                     "type": "object",
                     "properties": {
                         "domain": {
@@ -1604,7 +1608,7 @@ class HomeAssistantMCPTools:
             {
                 "name": "get_area_entities",
                 "description": "Get all entities in a specific area",
-                "parameters": {
+                "inputSchema": {
                     "type": "object",
                     "properties": {
                         "area_id": {
