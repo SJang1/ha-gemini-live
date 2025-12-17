@@ -126,6 +126,10 @@ class GeminiLiveCard extends HTMLElement {
         this._handleVisibilityChange = this._handleVisibilityChange.bind(this);
         // When set, suppress automatic reconnect attempts (used during go_away/error)
         this._suppressAutoReconnect = false;
+
+        // Default behavior: do not resume prior sessions unless user explicitly enables it.
+        // Clear any cached resumption handle on startup so auto-resume never happens by default.
+        this._clearResumptionHandle("init");
     }
 
     set hass(hass) {
@@ -323,6 +327,17 @@ class GeminiLiveCard extends HTMLElement {
         if (this._subscription) {
             this._subscription();
             this._subscription = null;
+        }
+    }
+
+    _clearResumptionHandle(reason = "manual") {
+        try {
+            localStorage.removeItem('gemini_live_handle');
+        } catch (e) { /* ignore */ }
+        this._resumptionHandle = null;
+        this._sessionResumable = false;
+        if (DEBUG_LOG) {
+            console.debug('RESUMPTION_HANDLE_CLEARED', { reason });
         }
     }
 
@@ -574,6 +589,11 @@ class GeminiLiveCard extends HTMLElement {
 
     _handleSessionResumptionUpdate(data) {
         logWS('recv', 'SESSION_RESUMPTION_UPDATE_HANDLED', data);
+        // Respect user setting: when resumption is disabled, always clear any handle received.
+        if (!this._resumptionEnabled) {
+            this._clearResumptionHandle('update_disabled');
+            return;
+        }
         // Store the resumption handle for later use
         if (data.handle) {
             this._resumptionHandle = data.handle;
@@ -674,7 +694,14 @@ class GeminiLiveCard extends HTMLElement {
         try {
             // Check for stored resumption handle
             const storageKey = `gemini_live_handle`;
-            const storedHandle = localStorage.getItem(storageKey);
+            let storedHandle = null;
+
+            // Only allow resume when user explicitly enabled it; otherwise clear any stale handle.
+            if (this._resumptionEnabled) {
+                storedHandle = localStorage.getItem(storageKey);
+            } else {
+                this._clearResumptionHandle('connect_disabled');
+            }
 
             const connectParams = {
                 type: `${DOMAIN}/connect`,

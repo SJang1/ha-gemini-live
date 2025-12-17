@@ -531,11 +531,17 @@ async def websocket_connect(
             try:
                 routes = data.setdefault("routes", {})
                 routes.setdefault(client_uuid, ConnectionRoute(client_uuid=client_uuid))
-                routes[client_uuid].hassio_google_ws = id(new_client)
+                # Will update google_ws after connect succeeds
+                routes[client_uuid].hassio_google_ws = None
                 routes[client_uuid].user_ws = id(connection)
                 routes[client_uuid].created_at = asyncio.get_event_loop().time()
-            except Exception:
-                pass
+                _LOGGER.debug(
+                    "Created route for new client_uuid=%s: user_ws=%s (google_ws pending connect)",
+                    client_uuid,
+                    id(connection),
+                )
+            except Exception as e:
+                _LOGGER.warning("Failed to create route for new client: %s", e)
             _LOGGER.info(
                 "Created per-connection client %s for entry %s (ws=%s)",
                 client_uuid,
@@ -655,28 +661,70 @@ async def websocket_connect(
             _LOGGER.info("Sending function result for %s: %s", function_name, result)
             await client.send_function_result(call_id, result)
         
-        # Register the handler
+        # Register event handler to update Google WS ID on session start/resume
+        async def on_session_started_or_resumed(event_data: dict[str, Any]) -> None:
+            """Update routes with new Google WS ID when session starts or resumes."""
+            try:
+                routes = data.setdefault("routes", {})
+                if client_uuid and client_uuid in routes:
+                    google_ws_id = None
+                    try:
+                        google_ws_id = client.get_google_ws_id()
+                    except Exception:
+                        google_ws_id = id(client)
+                    
+                    routes[client_uuid].hassio_google_ws = google_ws_id
+                    routes[client_uuid].server_connected = True
+                    routes[client_uuid].last_seen = asyncio.get_event_loop().time()
+                    _LOGGER.info(
+                        "Updated route after session event (client_uuid=%s google_ws=%s event=%s)",
+                        client_uuid,
+                        google_ws_id,
+                        "started" if "started" in str(event_data) else "resumed",
+                    )
+            except Exception as e:
+                _LOGGER.warning("Failed to update route after session event: %s", e)
+        
+        # Register the handlers
         client.on(EVENT_FUNCTION_CALL, on_function_call)
-        _LOGGER.debug("Registered function_call handler for client %s (ws=%s)", client_uuid, id(connection))
+        client.on(EVENT_SESSION_STARTED, on_session_started_or_resumed)
+        client.on(EVENT_SESSION_RESUMED, on_session_started_or_resumed)
+        _LOGGER.debug("Registered handlers for client %s (ws=%s)", client_uuid, id(connection))
         # Store for cleanup (per-client)
         if client_uuid:
             clients.setdefault(client_uuid, {}).setdefault("meta", {})
             clients[client_uuid].setdefault("meta", {})
             clients[client_uuid]["meta"]["_function_call_handler"] = on_function_call
+            clients[client_uuid]["meta"]["_session_handler"] = on_session_started_or_resumed
         else:
             data["_function_call_handler"] = on_function_call
+            data["_session_handler"] = on_session_started_or_resumed
         
         success = await client.connect()
 
-        # Update route/server status for this client_uuid
+        # Update route/server status for this client_uuid with new Google WS ID
         try:
             routes = data.setdefault("routes", {})
             if client_uuid and client_uuid in routes:
-                routes[client_uuid].hassio_google_ws = id(client)
+                # Get the new Google websocket ID from the client
+                google_ws_id = None
+                try:
+                    google_ws_id = client.get_google_ws_id()
+                except Exception:
+                    google_ws_id = id(client)
+                
+                routes[client_uuid].hassio_google_ws = google_ws_id
                 routes[client_uuid].server_connected = bool(success)
                 routes[client_uuid].last_seen = asyncio.get_event_loop().time()
-        except Exception:
-            pass
+                _LOGGER.info(
+                    "Updated route for client_uuid=%s: user_ws=%s google_ws=%s connected=%s",
+                    client_uuid,
+                    id(connection),
+                    google_ws_id,
+                    success,
+                )
+        except Exception as e:
+            _LOGGER.warning("Failed to update route after connect: %s", e)
         
         # Fire connected event for binary sensor
         if success and entry_id:
@@ -742,13 +790,19 @@ async def websocket_disconnect(
 
         _LOGGER.debug("Disconnect requested for client %s (ws=%s)", client_uuid, id(connection))
 
-        # Remove function call handler if registered
+        # Remove function call and session handlers if registered
         if client_uuid and client_uuid in clients:
             meta = clients[client_uuid].get("meta", {})
             handler = meta.pop("_function_call_handler", None)
             if handler and client:
                 client.off(EVENT_FUNCTION_CALL, handler)
                 _LOGGER.debug("Unregistered function_call handler for client %s (ws=%s)", client_uuid, id(connection))
+            
+            session_handler = meta.pop("_session_handler", None)
+            if session_handler and client:
+                client.off(EVENT_SESSION_STARTED, session_handler)
+                client.off(EVENT_SESSION_RESUMED, session_handler)
+                _LOGGER.debug("Unregistered session handlers for client %s (ws=%s)", client_uuid, id(connection))
         else:
             # Legacy single-client cleanup
             handler = data.pop("_function_call_handler", None)
@@ -757,6 +811,14 @@ async def websocket_disconnect(
                 if legacy:
                     legacy.off(EVENT_FUNCTION_CALL, handler)
                     _LOGGER.debug("Unregistered legacy function_call handler")
+            
+            session_handler = data.pop("_session_handler", None)
+            if session_handler:
+                legacy = data.get("client")
+                if legacy:
+                    legacy.off(EVENT_SESSION_STARTED, session_handler)
+                    legacy.off(EVENT_SESSION_RESUMED, session_handler)
+                    _LOGGER.debug("Unregistered legacy session handlers")
         
         if client:
             _LOGGER.info("Disconnecting client %s (ws=%s)", client_uuid, id(connection))
@@ -2403,6 +2465,17 @@ def websocket_subscribe(
                 should_attach = True
                 target_client = cobj
 
+        # Log subscription attempt details for debugging
+        _LOGGER.debug(
+            "Subscribe handler attachment decision: connection=%s mapped_uuid=%s should_attach=%s entry_client_obj=%s legacy_client_obj=%s target_client=%s",
+            connection_id,
+            mapped_uuid,
+            should_attach,
+            id(entry_client_obj) if entry_client_obj else None,
+            id(legacy_client_obj) if legacy_client_obj else None,
+            id(target_client) if target_client else None,
+        )
+
         if should_attach and target_client:
             target_client.on(EVENT_AUDIO_DELTA, on_audio_delta)
             target_client.on(EVENT_INPUT_TRANSCRIPTION, on_transcript)
@@ -2416,6 +2489,12 @@ def websocket_subscribe(
             target_client.on(EVENT_GO_AWAY, on_go_away)
             target_client.on(EVENT_GENERATION_COMPLETE, on_generation_complete)
             attach_to_client = target_client
+            _LOGGER.info(
+                "Attached subscription handlers to client %s for connection %s mapped_uuid=%s",
+                id(target_client),
+                connection_id,
+                mapped_uuid,
+            )
         else:
             # Store handlers for later migration when a per-connection client is created
             clients.setdefault(mapped_uuid or f"legacy_{entry_id}", {}).setdefault("subscriptions", {})[connection_id] = {

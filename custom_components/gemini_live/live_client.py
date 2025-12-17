@@ -177,6 +177,14 @@ class GeminiLiveClient:
         """Return connection status."""
         return self._connected
 
+    def get_google_ws_id(self) -> int | None:
+        """Get the current Google session ID (changes on reconnect).
+        
+        Returns id(self._session) which uniquely identifies the current
+        Google websocket connection. Returns None if not connected.
+        """
+        return id(self._session) if self._session else None
+
     def on(self, event_type: str, handler: Callable) -> None:
         """Register an event handler."""
         if event_type not in self._event_handlers:
@@ -701,6 +709,9 @@ class GeminiLiveClient:
 
             self._connected = True
 
+            # Log the new Google session ID (changes on each reconnect)
+            _LOGGER.info("Connected with Google session ID: %s (owner_ws=%s)", id(self._session), self._owner_ws)
+
             # Install frame logger immediately to capture all frames for debugging
             try:
                 await self._install_ws_frame_logger(duration=600)  # 10 minutes
@@ -1219,6 +1230,7 @@ class GeminiLiveClient:
 
                     # Clean up session context and mark disconnected
                     self._connected = False
+                    _LOGGER.info("Session closed (owner_ws=%s)", self._owner_ws)
                     try:
                         if self._session_context:
                             try:
