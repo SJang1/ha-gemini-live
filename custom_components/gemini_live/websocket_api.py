@@ -79,6 +79,244 @@ class ConnectionRoute:
         }
 
 
+async def _disconnect_and_cleanup(data: dict, client_uuid: str, hass: HomeAssistant | None = None, entry_id: str | None = None) -> None:
+    """Disconnect and destroy a client session."""
+    clients = data.get("clients", {})
+    routes = data.get("routes", {})
+    
+    if client_uuid and client_uuid in clients:
+        client_entry = clients[client_uuid]
+        client = client_entry.get("client")
+        
+        # Unregister handlers
+        meta = client_entry.get("meta", {})
+        handler = meta.pop("_function_call_handler", None)
+        if handler and client:
+            client.off(EVENT_FUNCTION_CALL, handler)
+        
+        session_handler = meta.pop("_session_handler", None)
+        if session_handler and client:
+            client.off(EVENT_SESSION_STARTED, session_handler)
+            client.off(EVENT_SESSION_RESUMED, session_handler)
+
+        # IMPORTANT: Preserve subscriptions before destroying client entry.
+        # If we are about to destroy the client, we must move its stored subscriptions
+        # back to the global map so they can be migrated to the NEW client that
+        # will likely be created immediately after (e.g. in start_listening).
+        try:
+            stored_subs = client_entry.get("subscriptions", {})
+            _LOGGER.info(
+                "Cleanup: client %s has stored_subs keys=%s existing_global_subs_keys=%s",
+                client_uuid,
+                list(stored_subs.keys()) if stored_subs else None,
+                list(data.get("subscriptions", {}).keys()),
+            )
+            if stored_subs:
+                global_subs = data.setdefault("subscriptions", {})
+                for conn_id, handlers in stored_subs.items():
+                    # Restore to global map keyed by connection_id
+                    global_subs[conn_id] = handlers
+                    _LOGGER.info("Cleanup: preserved handlers for conn_id=%s types=%s to global", conn_id, list(handlers.keys()))
+                _LOGGER.debug("Preserved subscriptions for %d connections from destroyed client %s", len(stored_subs), client_uuid)
+        except Exception as e:
+            _LOGGER.warning("Failed to preserve subscriptions during cleanup: %s", e)
+
+        # Clear listening/speaking state for this client's owner connection
+        try:
+            owner_ws = client_entry.get("owner_ws")
+            if owner_ws:
+                client_states = data.setdefault("client_states", {})
+                if owner_ws in client_states:
+                    client_states[owner_ws]["listening"] = False
+                    client_states[owner_ws]["speaking"] = False
+                
+                # Update aggregate state and fire events to ensure sensors reset
+                data["is_listening"] = any(s.get("listening") for s in client_states.values())
+                data["is_speaking"] = any(s.get("speaking") for s in client_states.values())
+                
+                if hass and entry_id:
+                    hass.bus.async_fire(
+                        f"{DOMAIN}_listening_state_changed",
+                        {"entry_id": entry_id, "is_listening": data.get("is_listening", False)},
+                    )
+                    hass.bus.async_fire(
+                        f"{DOMAIN}_speaking_state_changed",
+                        {"entry_id": entry_id, "is_speaking": data.get("is_speaking", False)},
+                    )
+        except Exception:
+            pass
+
+        if client:
+            _LOGGER.info("Destroying client %s", client_uuid)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            
+        # Remove from clients
+        clients.pop(client_uuid, None)
+        
+        # Remove from routes
+        routes.pop(client_uuid, None)
+
+async def _create_and_connect_client(
+    hass: HomeAssistant,
+    data: dict,
+    client_uuid: str,
+    connection: websocket_api.ActiveConnection,
+    entry_id: str,
+    resumption_handle: str | None = None
+) -> GeminiLiveClient:
+    """Create and connect a new GeminiLiveClient."""
+    clients = data.setdefault("clients", {})
+    connections_by_ws = data.setdefault("connections_by_ws", {})
+    
+    api_key = data.get("api_key")
+    session_config = data.get("session_config")
+    if not api_key or not session_config:
+        raise ValueError("Integration not configured properly")
+
+    # Create a new GeminiLiveClient instance
+    new_client = GeminiLiveClient(api_key=api_key, session_config=session_config)
+    
+    # Tag the client with the owning frontend websocket id
+    try:
+        new_client.set_owner_ws(id(connection))
+    except Exception:
+        pass
+        
+    clients[client_uuid] = {
+        "client": new_client,
+        "created_at": asyncio.get_event_loop().time(),
+        "subscriptions": {},
+        "client_states": {},
+        "owner_ws": id(connection),
+        "meta": {"conversation_enabled": True, "is_placeholder": False},
+    }
+    
+    # Ensure route entry exists
+    try:
+        routes = data.setdefault("routes", {})
+        routes.setdefault(client_uuid, ConnectionRoute(client_uuid=client_uuid))
+        routes[client_uuid].user_ws = id(connection)
+        routes[client_uuid].hassio_google_ws = id(new_client)
+        routes[client_uuid].created_at = asyncio.get_event_loop().time()
+        routes[client_uuid].meta.setdefault("is_placeholder", False)
+    except Exception:
+        pass
+        
+    client = new_client
+    # Map this websocket connection to the client_uuid
+    connections_by_ws[id(connection)] = client_uuid
+    
+    # Migrate any stored subscriptions
+    try:
+        connection_id = id(connection)
+        legacy_client = data.get("client")
+        _migrate_subscriptions_to_client(data, client_uuid, connection_id, new_client, legacy_client)
+    except Exception:
+        _LOGGER.debug("Failed to migrate subscription handlers to new client %s", client_uuid)
+
+    # Set resumption handle if provided
+    if resumption_handle:
+        _LOGGER.info("Using resumption handle for session resume")
+        client.set_resumption_handle(resumption_handle)
+    
+    # Register handlers
+    ha_tools = data.get("ha_tools")
+    mcp_handler = data.get("mcp_handler")
+    
+    async def on_function_call(event_data: dict[str, Any]) -> None:
+        """Handle function calls from Gemini and send results back."""
+        call_id = event_data.get("call_id", "")
+        function_name = event_data.get("name", "")
+        arguments = event_data.get("arguments", {})
+        
+        _LOGGER.info("Handling function call: %s (call_id=%s)", function_name, call_id)
+        result = None
+        
+        # Check for Home Assistant built-in tools
+        if ha_tools and function_name in ["get_entity_state", "call_service", "get_entities_by_domain", "get_area_entities"]:
+            result = await ha_tools.execute_tool(function_name, arguments)
+        # Check if this is an MCP server function
+        elif mcp_handler and "__" in function_name:
+            parsed = mcp_handler.parse_function_name(function_name)
+            if parsed:
+                server_name, tool_name = parsed
+                _LOGGER.info("Calling MCP tool: %s/%s", server_name, tool_name)
+                result = await mcp_handler.call_tool(server_name, tool_name, arguments)
+
+        # Agent fallback
+        if result is None:
+            try:
+                agent = data.get("agent")
+                if agent and hasattr(agent, "_execute_function"):
+                    try:
+                        result = await agent._execute_function(function_name, call_id, arguments)
+                    except Exception:
+                        result = None
+            except Exception:
+                result = None
+
+        if result is None:
+            result = {"error": f"Unknown function: {function_name}"}
+        
+        _LOGGER.info("Sending function result for %s: %s", function_name, result)
+        await client.send_function_result(call_id, result)
+    
+    async def on_session_started_or_resumed(event_data: dict[str, Any]) -> None:
+        """Update routes with new Google WS ID when session starts or resumes."""
+        try:
+            routes = data.setdefault("routes", {})
+            if client_uuid and client_uuid in routes:
+                google_ws_id = None
+                try:
+                    google_ws_id = client.get_google_ws_id()
+                except Exception:
+                    google_ws_id = id(client)
+                
+                routes[client_uuid].hassio_google_ws = google_ws_id
+                routes[client_uuid].server_connected = True
+                routes[client_uuid].last_seen = asyncio.get_event_loop().time()
+        except Exception as e:
+            _LOGGER.warning("Failed to update route after session event: %s", e)
+    
+    client.on(EVENT_FUNCTION_CALL, on_function_call)
+    client.on(EVENT_SESSION_STARTED, on_session_started_or_resumed)
+    client.on(EVENT_SESSION_RESUMED, on_session_started_or_resumed)
+    
+    # Store for cleanup
+    clients[client_uuid].setdefault("meta", {})
+    clients[client_uuid]["meta"]["_function_call_handler"] = on_function_call
+    clients[client_uuid]["meta"]["_session_handler"] = on_session_started_or_resumed
+    
+    success = await client.connect()
+    
+    # Update route/server status
+    try:
+        routes = data.setdefault("routes", {})
+        if client_uuid and client_uuid in routes:
+            google_ws_id = None
+            try:
+                google_ws_id = client.get_google_ws_id()
+            except Exception:
+                google_ws_id = id(client)
+            
+            routes[client_uuid].hassio_google_ws = google_ws_id
+            routes[client_uuid].server_connected = bool(success)
+            routes[client_uuid].last_seen = asyncio.get_event_loop().time()
+    except Exception:
+        pass
+        
+    if success and entry_id:
+        hass.bus.async_fire(
+            f"{DOMAIN}_connected_state_changed",
+            {"entry_id": entry_id, "is_connected": True},
+        )
+        hass.bus.async_fire(f"{DOMAIN}_client_added", {"entry_id": entry_id, "client_uuid": client_uuid})
+
+    return client
+
 
 def _ensure_ws_client_uuid(data: dict, connection: websocket_api.ActiveConnection) -> str:
     """Ensure there is a server-side client UUID mapped to this websocket.
@@ -234,8 +472,21 @@ def _migrate_subscriptions_to_client(
         migrated_global = 0
         migrated_perclient = 0
 
+        _LOGGER.info(
+            "Migration starting for client_uuid=%s connection_id=%s: global_subs_keys=%s new_client=%s",
+            client_uuid,
+            connection_id,
+            list(subscriptions.keys()),
+            id(new_client),
+        )
+
         # First migrate global subscriptions for this connection id
         old_handlers = subscriptions.pop(connection_id, None)
+        _LOGGER.info(
+            "Migration: global old_handlers found=%s handler_types=%s",
+            old_handlers is not None,
+            list(old_handlers.keys()) if old_handlers else None,
+        )
         if old_handlers:
             for ev_type, handler in list(old_handlers.items()):
                 try:
@@ -246,8 +497,9 @@ def _migrate_subscriptions_to_client(
                             pass
                     new_client.on(ev_type, handler)
                     migrated_global += 1
-                except Exception:
-                    _LOGGER.debug("Failed attaching migrated handler %s to new client %s", ev_type, client_uuid)
+                    _LOGGER.info("Migration: attached global handler %s to client %s", ev_type, id(new_client))
+                except Exception as e:
+                    _LOGGER.warning("Failed attaching migrated handler %s to new client %s: %s", ev_type, client_uuid, e)
             # Record under new client's stored subscriptions for cleanup
             clients = data.setdefault("clients", {})
             clients.setdefault(client_uuid, {}).setdefault("subscriptions", {})[connection_id] = old_handlers
@@ -402,9 +654,27 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
                             clients = data.get("clients", {})
                             routes = data.get("routes", {})
                             active = data.get("active_connections", {})
+                            
+                            # Build client summary with actual handler counts from client object
+                            clients_summary = {}
+                            for k, v in clients.items():
+                                client_obj = v.get("client")
+                                handler_count = 0
+                                if client_obj and hasattr(client_obj, "_event_handlers"):
+                                    try:
+                                        handler_count = sum(len(h) for h in client_obj._event_handlers.values())
+                                    except Exception:
+                                        pass
+                                clients_summary[k] = {
+                                    "id": id(client_obj) if client_obj else None,
+                                    "owner_ws": v.get("owner_ws"),
+                                    "subs_stored": len(v.get("subscriptions", {})),
+                                    "handlers_attached": handler_count,
+                                }
+                            
                             summary = {
                                 "entry_id": eid,
-                                "clients": {k: {"id": id(v.get("client")) if v.get("client") else None, "owner_ws": v.get("owner_ws"), "subs": len(v.get("subscriptions", {}))} for k, v in clients.items()},
+                                "clients": clients_summary,
                                 "routes": {k: v.to_debug() if hasattr(v, "to_debug") else str(v) for k, v in routes.items()},
                                 "active_connections": list(active.keys()),
                             }
@@ -448,295 +718,34 @@ async def websocket_connect(
         connection.send_error(msg["id"], "not_found", "Gemini Live Audio not configured")
         return
 
-    # Support isolated per-websocket clients. Frontend can provide `client_uuid` to identify its client.
-    # Use server-side ws-based client uuid; ignore frontend-provided one
-    clients = data.setdefault("clients", {})
-    connections_by_ws = data.setdefault("connections_by_ws", {})
+    # Use server-side ws-based client uuid
     client_uuid = _ensure_ws_client_uuid(data, connection)
+    clients = data.setdefault("clients", {})
 
-    # Legacy single client for backwards compatibility
-    legacy_client: GeminiLiveClient | None = data.get("client")
+    # Check if client already exists and is not a placeholder
+    client_entry = clients.get(client_uuid)
+    client = client_entry.get("client") if client_entry else None
+    is_placeholder = client_entry.get("meta", {}).get("is_placeholder", True) if client_entry else True
 
-    client_entry = None
-    if client_uuid:
-        client_entry = clients.get(client_uuid)
-    else:
-        # If no uuid provided, prefer any existing mapping for this websocket
-        # so subscribe/connect use the same per-connection client UUID.
-        mapped = connections_by_ws.get(id(connection))
-        if mapped and mapped in clients:
-            client_uuid = mapped
-            client_entry = clients.get(client_uuid)
-        else:
-            # Otherwise create a new uuid (per-websocket)
-            import uuid as _uuid
-            client_uuid = _uuid.uuid4().hex
-            client_entry = None
-
-    if client_entry:
-        client: GeminiLiveClient = client_entry.get("client")
-    else:
-        client = None
-    ha_tools: HomeAssistantMCPTools = data.get("ha_tools")
-    mcp_handler = data.get("mcp_handler")
-
-    # If client is None we will create one below for isolated per-websocket mode
-
-    try:
-        # If we don't have a client for this uuid, create one now (isolated per websocket)
-        if not client:
-            api_key = data.get("api_key")
-            session_config = data.get("session_config")
-            if not api_key or not session_config:
-                connection.send_error(msg["id"], "not_found", "Integration not configured properly")
-                return
-
-            # Create a new GeminiLiveClient instance for this websocket
-            new_client = GeminiLiveClient(api_key=api_key, session_config=session_config)
-            # Tag the client with the owning frontend websocket id
-            try:
-                new_client.set_owner_ws(id(connection))
-            except Exception:
-                pass
-            clients[client_uuid] = {
-                "client": new_client,
-                "created_at": asyncio.get_event_loop().time(),
-                "subscriptions": {},
-                "client_states": {},
-                "owner_ws": id(connection),
-                "meta": {"conversation_enabled": True, "is_placeholder": True},
-            }
-            # Ensure route entry exists and points to this new per-connection client
-            try:
-                routes = data.setdefault("routes", {})
-                routes.setdefault(client_uuid, ConnectionRoute(client_uuid=client_uuid))
-                routes[client_uuid].user_ws = id(connection)
-                routes[client_uuid].hassio_google_ws = id(new_client)
-                routes[client_uuid].created_at = asyncio.get_event_loop().time()
-                routes[client_uuid].meta.setdefault("is_placeholder", True)
-            except Exception:
-                pass
-            client = new_client
-            # Map this websocket connection to the client_uuid so subscribe/disconnect can find it
-            connections_by_ws[id(connection)] = client_uuid
-            # Migrate any stored subscriptions (global or per-client) to the new client
-            try:
-                connection_id = id(connection)
-                legacy_client = legacy_client if 'legacy_client' in locals() else data.get("client")
-                _migrate_subscriptions_to_client(data, client_uuid, connection_id, new_client, legacy_client)
-            except Exception:
-                _LOGGER.debug("Failed to migrate subscription handlers to new per-connection client %s", client_uuid)
-
-            # Ensure route reflects the newly created client
-            try:
-                routes = data.setdefault("routes", {})
-                routes.setdefault(client_uuid, ConnectionRoute(client_uuid=client_uuid))
-                # Will update google_ws after connect succeeds
-                routes[client_uuid].hassio_google_ws = None
-                routes[client_uuid].user_ws = id(connection)
-                routes[client_uuid].created_at = asyncio.get_event_loop().time()
-                _LOGGER.debug(
-                    "Created route for new client_uuid=%s: user_ws=%s (google_ws pending connect)",
-                    client_uuid,
-                    id(connection),
-                )
-            except Exception as e:
-                _LOGGER.warning("Failed to create route for new client: %s", e)
-            _LOGGER.info(
-                "Created per-connection client %s for entry %s (ws=%s)",
-                client_uuid,
-                entry_id,
-                id(connection),
-            )
-            # Notify HA that a new per-connection client was created
-            try:
-                hass.bus.async_fire(f"{DOMAIN}_client_added", {"entry_id": entry_id, "client_uuid": client_uuid})
-            except Exception:
-                _LOGGER.debug("Failed to fire client_added event")
-
-        # If a session already exists, reuse it instead of tearing it down.
-        if client.connected:
-            _LOGGER.debug("Client already connected; reusing existing session (will increment connection count)")
-        
-        # Set resumption handle if provided (for session resumption)
-        resumption_handle = msg.get("resumption_handle")
-        if resumption_handle:
-            _LOGGER.info("Using resumption handle for session resume")
-            client.set_resumption_handle(resumption_handle)
-        
-        # Register function call handler BEFORE connecting
-        async def on_function_call(event_data: dict[str, Any]) -> None:
-            """Handle function calls from Gemini and send results back."""
-            call_id = event_data.get("call_id", "")
-            function_name = event_data.get("name", "")
-            arguments = event_data.get("arguments", {})
-            
-            _LOGGER.info("Handling function call: %s (call_id=%s)", function_name, call_id)
-            # Debug: enumerate available function names from various sources
-            try:
-                available_names = set()
-                # HA builtins
-                try:
-                    if ha_tools:
-                        for t in ha_tools.get_builtin_tools():
-                            if isinstance(t, dict) and t.get("name"):
-                                available_names.add(t.get("name"))
-                except Exception:
-                    pass
-
-                # MCP-provided flat functions
-                try:
-                    if mcp_handler:
-                        for t in mcp_handler.get_tools_as_functions():
-                            if isinstance(t, dict) and t.get("name"):
-                                available_names.add(t.get("name"))
-                except Exception:
-                    pass
-
-                # Session-configured tools (can include dict-shaped Tool entries)
-                try:
-                    sc = data.get("session_config") if isinstance(data, dict) else None
-                    tools_list = getattr(sc, "tools", []) if sc is not None else []
-                    for t in tools_list or []:
-                        if isinstance(t, dict):
-                            # Tool dict may contain 'function_declarations' list
-                            fdecls = t.get("function_declarations") or []
-                            if fdecls:
-                                for fd in fdecls:
-                                    if isinstance(fd, dict) and fd.get("name"):
-                                        available_names.add(fd.get("name"))
-                            elif t.get("name"):
-                                available_names.add(t.get("name"))
-                        elif isinstance(t, str):
-                            available_names.add(t)
-                except Exception:
-                    pass
-
-                # Client raw declarations (if present)
-                try:
-                    if client is not None and hasattr(client, "_raw_function_declarations"):
-                        for k in getattr(client, "_raw_function_declarations", {}).keys():
-                            if k:
-                                available_names.add(k)
-                except Exception:
-                    pass
-
-                _LOGGER.debug("Available function names at call time: %s", sorted([n for n in available_names if n]))
-            except Exception:
-                _LOGGER.debug("Failed to enumerate available functions for debug")
-            
-            result = None
-            
-            # Check for Home Assistant built-in tools
-            if ha_tools and function_name in ["get_entity_state", "call_service", "get_entities_by_domain", "get_area_entities"]:
-                result = await ha_tools.execute_tool(function_name, arguments)
-            # Check if this is an MCP server function (format: server_name__tool_name)
-            elif mcp_handler and "__" in function_name:
-                parsed = mcp_handler.parse_function_name(function_name)
-                if parsed:
-                    server_name, tool_name = parsed
-                    _LOGGER.info("Calling MCP tool: %s/%s", server_name, tool_name)
-                    result = await mcp_handler.call_tool(server_name, tool_name, arguments)
-
-            # If still unknown, try using the conversation agent's executor
-            # (reuses agent logic to handle flat tools and any additional
-            # executors it may provide). This allows flat function defs
-            # (e.g., GitHub-like tools) configured in session/tools to be
-            # resolved by the agent if it knows how to execute them.
-            if result is None:
-                try:
-                    agent = data.get("agent")
-                    if agent and hasattr(agent, "_execute_function"):
-                        try:
-                            result = await agent._execute_function(function_name, call_id, arguments)
-                        except Exception:
-                            result = None
-                except Exception:
-                    result = None
-
-            if result is None:
-                result = {"error": f"Unknown function: {function_name}"}
-            
-            # Send result back to Gemini
-            _LOGGER.info("Sending function result for %s: %s", function_name, result)
-            await client.send_function_result(call_id, result)
-        
-        # Register event handler to update Google WS ID on session start/resume
-        async def on_session_started_or_resumed(event_data: dict[str, Any]) -> None:
-            """Update routes with new Google WS ID when session starts or resumes."""
-            try:
-                routes = data.setdefault("routes", {})
-                if client_uuid and client_uuid in routes:
-                    google_ws_id = None
-                    try:
-                        google_ws_id = client.get_google_ws_id()
-                    except Exception:
-                        google_ws_id = id(client)
-                    
-                    routes[client_uuid].hassio_google_ws = google_ws_id
-                    routes[client_uuid].server_connected = True
-                    routes[client_uuid].last_seen = asyncio.get_event_loop().time()
-                    _LOGGER.info(
-                        "Updated route after session event (client_uuid=%s google_ws=%s event=%s)",
-                        client_uuid,
-                        google_ws_id,
-                        "started" if "started" in str(event_data) else "resumed",
-                    )
-            except Exception as e:
-                _LOGGER.warning("Failed to update route after session event: %s", e)
-        
-        # Register the handlers
-        client.on(EVENT_FUNCTION_CALL, on_function_call)
-        client.on(EVENT_SESSION_STARTED, on_session_started_or_resumed)
-        client.on(EVENT_SESSION_RESUMED, on_session_started_or_resumed)
-        _LOGGER.debug("Registered handlers for client %s (ws=%s)", client_uuid, id(connection))
-        # Store for cleanup (per-client)
-        if client_uuid:
-            clients.setdefault(client_uuid, {}).setdefault("meta", {})
-            clients[client_uuid].setdefault("meta", {})
-            clients[client_uuid]["meta"]["_function_call_handler"] = on_function_call
-            clients[client_uuid]["meta"]["_session_handler"] = on_session_started_or_resumed
-        else:
-            data["_function_call_handler"] = on_function_call
-            data["_session_handler"] = on_session_started_or_resumed
-        
-        success = await client.connect()
-
-        # Update route/server status for this client_uuid with new Google WS ID
+    # If we need a new client (doesn't exist or is placeholder), create it
+    if not client or is_placeholder:
         try:
-            routes = data.setdefault("routes", {})
-            if client_uuid and client_uuid in routes:
-                # Get the new Google websocket ID from the client
-                google_ws_id = None
-                try:
-                    google_ws_id = client.get_google_ws_id()
-                except Exception:
-                    google_ws_id = id(client)
-                
-                routes[client_uuid].hassio_google_ws = google_ws_id
-                routes[client_uuid].server_connected = bool(success)
-                routes[client_uuid].last_seen = asyncio.get_event_loop().time()
-                _LOGGER.info(
-                    "Updated route for client_uuid=%s: user_ws=%s google_ws=%s connected=%s",
-                    client_uuid,
-                    id(connection),
-                    google_ws_id,
-                    success,
-                )
-        except Exception as e:
-            _LOGGER.warning("Failed to update route after connect: %s", e)
-        
-        # Fire connected event for binary sensor
-        if success and entry_id:
-            hass.bus.async_fire(
-                f"{DOMAIN}_connected_state_changed",
-                {"entry_id": entry_id, "is_connected": True},
+            client = await _create_and_connect_client(
+                hass, data, client_uuid, connection, entry_id, msg.get("resumption_handle")
             )
-        
-        # Return the client_uuid to frontend so it can use it for subsequent calls
-        connection.send_result(msg["id"], {"connected": success, "client_uuid": client_uuid})
-    except Exception as e:
-        connection.send_error(msg["id"], "connection_failed", str(e))
+        except Exception as e:
+            connection.send_error(msg["id"], "connection_failed", str(e))
+            return
+    else:
+        # Reuse existing client
+        if not client.connected:
+            # Set resumption handle if provided
+            resumption_handle = msg.get("resumption_handle")
+            if resumption_handle:
+                client.set_resumption_handle(resumption_handle)
+            await client.connect()
+
+    connection.send_result(msg["id"], {"connected": client.connected, "client_uuid": client_uuid})
 
 
 @websocket_api.websocket_command(
@@ -756,140 +765,35 @@ async def websocket_disconnect(
     data, entry_id = _get_data(hass, msg.get("entry_id"))
 
     if data:
-        client = data.get("client")
-
-        # Remove function call handler if registered
-        # If client_uuid provided, disconnect that specific client, otherwise try lookup by websocket
-        # Use server-side ws-based client uuid; ignore frontend-provided one
         clients = data.setdefault("clients", {})
         connections_by_ws = data.setdefault("connections_by_ws", {})
         client_uuid = _ensure_ws_client_uuid(data, connection)
 
-        client = None
-        if client_uuid and client_uuid in clients:
-            client = clients[client_uuid].get("client")
-        else:
-            # Try mapping from this websocket connection id
+        req_uuid = msg.get("client_uuid")
+        if req_uuid and req_uuid in clients:
+            client_uuid = req_uuid
+        elif not req_uuid:
             mapped_uuid = connections_by_ws.get(id(connection))
             if mapped_uuid and mapped_uuid in clients:
-                client = clients[mapped_uuid].get("client")
                 client_uuid = mapped_uuid
-        # If requesting websocket refers to a client_uuid owned by another websocket,
-        # treat this as a disconnect request for a different client and report
-        # not connected to the requester rather than performing the disconnect.
+
         current_mapped = connections_by_ws.get(id(connection))
         if client_uuid and client_uuid in clients and current_mapped and current_mapped != client_uuid:
             _LOGGER.debug(
-                "Disconnect request for client %s from ws=%s refers to a different owner (mapped=%s); returning not connected",
+                "Disconnect request for client %s from ws=%s refers to a different owner",
                 client_uuid,
                 id(connection),
-                current_mapped,
             )
             connection.send_result(msg["id"], {"connected": False})
             return
 
         _LOGGER.debug("Disconnect requested for client %s (ws=%s)", client_uuid, id(connection))
-
-        # Remove function call and session handlers if registered
-        if client_uuid and client_uuid in clients:
-            meta = clients[client_uuid].get("meta", {})
-            handler = meta.pop("_function_call_handler", None)
-            if handler and client:
-                client.off(EVENT_FUNCTION_CALL, handler)
-                _LOGGER.debug("Unregistered function_call handler for client %s (ws=%s)", client_uuid, id(connection))
-            
-            session_handler = meta.pop("_session_handler", None)
-            if session_handler and client:
-                client.off(EVENT_SESSION_STARTED, session_handler)
-                client.off(EVENT_SESSION_RESUMED, session_handler)
-                _LOGGER.debug("Unregistered session handlers for client %s (ws=%s)", client_uuid, id(connection))
-        else:
-            # Legacy single-client cleanup
-            handler = data.pop("_function_call_handler", None)
-            if handler:
-                legacy = data.get("client")
-                if legacy:
-                    legacy.off(EVENT_FUNCTION_CALL, handler)
-                    _LOGGER.debug("Unregistered legacy function_call handler")
-            
-            session_handler = data.pop("_session_handler", None)
-            if session_handler:
-                legacy = data.get("client")
-                if legacy:
-                    legacy.off(EVENT_SESSION_STARTED, session_handler)
-                    legacy.off(EVENT_SESSION_RESUMED, session_handler)
-                    _LOGGER.debug("Unregistered legacy session handlers")
-        
-        if client:
-            _LOGGER.info("Disconnecting client %s (ws=%s)", client_uuid, id(connection))
-            await client.disconnect()
-            # Update route/server status
-            try:
-                routes = data.setdefault("routes", {})
-                if client_uuid and client_uuid in routes:
-                    routes[client_uuid].server_connected = False
-                    routes[client_uuid].last_seen = asyncio.get_event_loop().time()
-            except Exception:
-                pass
-            # Ensure listening/speaking flags and subscriptions cleared on explicit disconnect
-            try:
-                # Remove any registered subscription handlers associated with
-                # this specific client (do NOT remove the global subscriptions map)
-                subscriptions = data.setdefault("subscriptions", {})
-
-                # If we have a client_uuid entry, prefer removing only its subscriptions
-                if client_uuid and client_uuid in clients:
-                    client_entry = clients.get(client_uuid, {})
-                    per_client_subs = client_entry.get("subscriptions", {})
-                    for conn_id, handlers in list(per_client_subs.items()):
-                        for event_type, handler in handlers.items():
-                            try:
-                                client.off(event_type, handler)
-                            except Exception:
-                                pass
-                        # remove from global subscriptions map as well
-                        subscriptions.pop(conn_id, None)
-                    # clear stored per-client subscription info
-                    client_entry.pop("subscriptions", None)
-                    # clear per-client client_states if present
-                    client_entry.pop("client_states", None)
-                else:
-                    # No client_uuid available; attempt best-effort removal of handlers
-                    # registered on this client object by scanning global subscriptions
-                    for conn_id, handlers in list(subscriptions.items()):
-                        removed_any = False
-                        for event_type, handler in list(handlers.items()):
-                            try:
-                                client.off(event_type, handler)
-                                removed_any = True
-                            except Exception:
-                                pass
-                        if removed_any:
-                            subscriptions.pop(conn_id, None)
-
-                # Recompute aggregated per-connection state from remaining entries
-                client_states = data.setdefault("client_states", {})
-                data["is_listening"] = any(s.get("listening") for s in client_states.values())
-                data["is_speaking"] = any(s.get("speaking") for s in client_states.values())
-                if entry_id:
-                    hass.bus.async_fire(
-                        f"{DOMAIN}_listening_state_changed",
-                        {"entry_id": entry_id, "is_listening": False},
-                    )
-                    hass.bus.async_fire(
-                        f"{DOMAIN}_speaking_state_changed",
-                        {"entry_id": entry_id, "is_speaking": False},
-                    )
-            except Exception:  # Defensive: don't let cleanup break disconnect
-                _LOGGER.debug("Error clearing speaking/listening flags during disconnect")
-        
-        # Fire disconnected event for binary sensor
+        await _disconnect_and_cleanup(data, client_uuid, hass, entry_id)
         if entry_id:
             hass.bus.async_fire(
                 f"{DOMAIN}_connected_state_changed",
                 {"entry_id": entry_id, "is_connected": False},
             )
-        
 
     connection.send_result(msg["id"], {"connected": False})
 
@@ -1066,48 +970,33 @@ async def websocket_start_listening(
         connection.send_error(msg["id"], "not_found", "Gemini Live Audio not configured")
         return
 
-    # Resolve per-connection client if available, otherwise fall back to legacy
-    clients = data.setdefault("clients", {})
+    # Resolve per-connection client if available
     connections_by_ws = data.setdefault("connections_by_ws", {})
     client_uuid = connections_by_ws.get(id(connection)) or _ensure_ws_client_uuid(data, connection)
-    client: GeminiLiveClient | None = None
+    clients = data.setdefault("clients", {})
+
+    # Check if client_uuid is existing on class, if exist, destroy
     if client_uuid and client_uuid in clients:
-        client = clients[client_uuid].get("client")
-    else:
-        client = data.get("client")
-
-    if not client:
-        connection.send_error(msg["id"], "not_found", "Client not found")
+        await _disconnect_and_cleanup(data, client_uuid, hass, entry_id)
+    
+    # Make a new one to connect, connect it
+    try:
+        client = await _create_and_connect_client(hass, data, client_uuid, connection, entry_id)
+    except Exception as e:
+        connection.send_error(msg["id"], "connection_failed", str(e))
         return
-
-    # Connect if not already connected - wait for actual connection
-    if not client.connected:
-        _LOGGER.info("Connecting to Gemini API for client %s (ws=%s) before starting listening...", client_uuid, id(connection))
-        success = await client.connect()
-        if not success:
-            connection.send_error(msg["id"], "connection_failed", "Failed to connect to Gemini API")
-            return
-        
-        # Fire connected event for binary sensor
-        hass.bus.async_fire(
-            f"{DOMAIN}_connected_state_changed",
-            {"entry_id": entry_id, "is_connected": True},
-        )
 
     # Update listening state for this websocket connection
     try:
         connection_id = id(connection)
-        # store global per-connection state
         client_states = data.setdefault("client_states", {})
         client_states.setdefault(connection_id, {"listening": False, "speaking": False})
         client_states[connection_id]["listening"] = True
 
-        # Also store per-client (per client_uuid) state if this is a per-connection client
         if client_uuid and client_uuid in clients:
             clients.setdefault(client_uuid, {}).setdefault("client_states", {})
             clients[client_uuid]["client_states"][connection_id] = client_states[connection_id]
 
-        # Aggregate listening state across connections (used for legacy/aggregate sensors)
         data["is_listening"] = any(s.get("listening") for s in client_states.values())
         hass.bus.async_fire(
             f"{DOMAIN}_listening_state_changed",
@@ -1140,19 +1029,11 @@ async def websocket_stop_listening(
         return
 
     # Resolve per-connection client for stop_listening as well
-    clients = data.setdefault("clients", {})
     connections_by_ws = data.setdefault("connections_by_ws", {})
     client_uuid = connections_by_ws.get(id(connection)) or _ensure_ws_client_uuid(data, connection)
-    client: GeminiLiveClient | None = None
-    if client_uuid and client_uuid in clients:
-        client = clients[client_uuid].get("client")
-
-    # Signal end of audio stream on resolved client or legacy
-    if not client:
-        client = data.get("client")
-
-    if client and client.connected:
-        await client.send_audio_stream_end()
+    
+    # Destroy client session on stop listening per user request
+    await _disconnect_and_cleanup(data, client_uuid, hass, entry_id)
 
     # Update listening state for this websocket connection
     try:
@@ -1160,14 +1041,6 @@ async def websocket_stop_listening(
         client_states = data.setdefault("client_states", {})
         if connection_id in client_states:
             client_states[connection_id]["listening"] = False
-
-        # Also update per-client client_states if present
-        client_uuid = data.setdefault("connections_by_ws", {}).get(id(connection)) or _ensure_ws_client_uuid(data, connection)
-        clients = data.setdefault("clients", {})
-        if client_uuid and client_uuid in clients:
-            clients.setdefault(client_uuid, {}).setdefault("client_states", {})
-            if connection_id in clients[client_uuid]["client_states"]:
-                clients[client_uuid]["client_states"][connection_id]["listening"] = False
 
         data["is_listening"] = any(s.get("listening") for s in client_states.values())
         hass.bus.async_fire(
@@ -1419,6 +1292,14 @@ def websocket_subscribe(
                     client_entry = clients[client_uuid]
                     client = client_entry.get("client")
                     legacy_client_obj = data.get("client")
+                    _LOGGER.info(
+                        "Subscribe: found existing client_uuid=%s client=%s legacy=%s is_same=%s is_placeholder=%s",
+                        client_uuid,
+                        id(client) if client else None,
+                        id(legacy_client_obj) if legacy_client_obj else None,
+                        client is legacy_client_obj,
+                        client_entry.get("meta", {}).get("is_placeholder", False),
+                    )
                     if client is legacy_client_obj:
                         api_key = data.get("api_key")
                         session_config = data.get("session_config")
@@ -2166,6 +2047,29 @@ def websocket_subscribe(
                 except Exception:
                     _LOGGER.debug("Error attempting client_obj.disconnect() for %s", mapped)
 
+                # Clear listening/speaking state for this connection and fire events
+                try:
+                    # Clear for this specific connection
+                    client_states.setdefault(connection_id, {})
+                    client_states[connection_id]["listening"] = False
+                    client_states[connection_id]["speaking"] = False
+                    
+                    # Update global aggregate state
+                    data["is_listening"] = any(s.get("listening") for s in client_states.values())
+                    data["is_speaking"] = any(s.get("speaking") for s in client_states.values())
+                    
+                    if entry_id:
+                        hass.bus.async_fire(
+                            f"{DOMAIN}_listening_state_changed",
+                            {"entry_id": entry_id, "is_listening": data.get("is_listening", False)},
+                        )
+                        hass.bus.async_fire(
+                            f"{DOMAIN}_speaking_state_changed",
+                            {"entry_id": entry_id, "is_speaking": data.get("is_speaking", False)},
+                        )
+                except Exception as e:
+                    _LOGGER.debug("Error clearing sensor state in on_error: %s", e)
+
                 # Clear stored client reference and per-connection state/subscriptions
                 try:
                     client_entry["client"] = None
@@ -2442,37 +2346,25 @@ def websocket_subscribe(
     try:
         clients = data.setdefault("clients", {})
         target_client = None
-        # Decide whether to attach handlers immediately or store them for
-        # later migration. Only attach if the client entry for this
-        # mapped_uuid points to a real per-connection client (not the
-        # legacy/shared `data.get("client")`). Otherwise store under the
-        # per-client `subscriptions` so they can be migrated when a real
-        # client is created.
+        
+        # Get the client entry for this websocket's mapped uuid
         client_entry = clients.get(mapped_uuid, {}) if mapped_uuid else {}
         entry_client_obj = client_entry.get("client") if client_entry else None
-        legacy_client_obj = data.get("client")
-
-        should_attach = False
-        target_client = None
-        if entry_client_obj and entry_client_obj is not legacy_client_obj:
-            # We have a real per-connection client object already
-            should_attach = True
-            target_client = entry_client_obj
-        elif not entry_client_obj and mapped_uuid and mapped_uuid in clients and clients.get(mapped_uuid).get("client"):
-            # Defensive: if client exists in entry and is not legacy
-            cobj = clients.get(mapped_uuid).get("client")
-            if cobj and cobj is not legacy_client_obj:
-                should_attach = True
-                target_client = cobj
+        is_placeholder = client_entry.get("meta", {}).get("is_placeholder", False) if client_entry else True
+        
+        # Determine if we should attach handlers directly
+        # Attach if: we have a real client object AND it's not a placeholder
+        should_attach = bool(entry_client_obj and not is_placeholder)
+        target_client = entry_client_obj if should_attach else None
 
         # Log subscription attempt details for debugging
-        _LOGGER.debug(
-            "Subscribe handler attachment decision: connection=%s mapped_uuid=%s should_attach=%s entry_client_obj=%s legacy_client_obj=%s target_client=%s",
+        _LOGGER.info(
+            "Subscribe handler attachment decision: connection=%s mapped_uuid=%s should_attach=%s entry_client_obj=%s is_placeholder=%s target_client=%s",
             connection_id,
             mapped_uuid,
             should_attach,
             id(entry_client_obj) if entry_client_obj else None,
-            id(legacy_client_obj) if legacy_client_obj else None,
+            is_placeholder,
             id(target_client) if target_client else None,
         )
 
@@ -2497,7 +2389,7 @@ def websocket_subscribe(
             )
         else:
             # Store handlers for later migration when a per-connection client is created
-            clients.setdefault(mapped_uuid or f"legacy_{entry_id}", {}).setdefault("subscriptions", {})[connection_id] = {
+            stored_handlers = {
                 EVENT_AUDIO_DELTA: on_audio_delta,
                 EVENT_INPUT_TRANSCRIPTION: on_transcript,
                 EVENT_OUTPUT_TRANSCRIPTION: on_output_transcript,
@@ -2510,9 +2402,16 @@ def websocket_subscribe(
                 EVENT_GO_AWAY: on_go_away,
                 EVENT_GENERATION_COMPLETE: on_generation_complete,
             }
+            clients.setdefault(mapped_uuid or f"legacy_{entry_id}", {}).setdefault("subscriptions", {})[connection_id] = stored_handlers
+            _LOGGER.info(
+                "Stored subscription handlers for later migration: connection=%s mapped_uuid=%s handler_types=%s",
+                connection_id,
+                mapped_uuid,
+                list(stored_handlers.keys()),
+            )
             attach_to_client = None
-    except Exception:
-        _LOGGER.debug("Failed to attach subscription handlers to target client for connection %s mapped_uuid=%s", connection_id, mapped_uuid)
+    except Exception as e:
+        _LOGGER.warning("Failed to attach subscription handlers to target client for connection %s mapped_uuid=%s: %s", connection_id, mapped_uuid, e)
 
     # Store handlers for cleanup
     subscriptions[connection_id] = {
@@ -2528,6 +2427,11 @@ def websocket_subscribe(
         EVENT_GO_AWAY: on_go_away,
         EVENT_GENERATION_COMPLETE: on_generation_complete,
     }
+    _LOGGER.info(
+        "Stored global subscriptions for cleanup: connection=%s keys_after=%s",
+        connection_id,
+        list(subscriptions.keys()),
+    )
 
     # Log registration details including which client object the handlers were attached to
     try:
@@ -2653,59 +2557,14 @@ def websocket_subscribe(
             )
         except Exception:
             _LOGGER.debug("Error cleaning up client state for connection %s", connection_id)
-        # Disconnect the specific per-websocket client if present
-        try:
-            connections_by_ws = data.setdefault("connections_by_ws", {})
-            clients = data.setdefault("clients", {})
-            mapped_uuid = connections_by_ws.pop(connection_id, None)
-            if mapped_uuid and mapped_uuid in clients:
-                _LOGGER.info("Cleaning up per-connection client %s for connection %s", mapped_uuid, connection_id)
-                try:
-                    cobj = clients.pop(mapped_uuid)
-                    client_obj = cobj.get("client")
-                    if client_obj:
-                        # Ensure any in-flight input/output is cleanly stopped
-                        try:
-                            if getattr(client_obj, "connected", False):
-                                hass.async_create_task(client_obj.send_audio_stream_end())
-                        except Exception:
-                            _LOGGER.debug("Failed to send_audio_stream_end for client %s", mapped_uuid)
-
-                        try:
-                            if getattr(client_obj, "connected", False):
-                                hass.async_create_task(client_obj.disconnect())
-                                hass.bus.async_fire(
-                                    f"{DOMAIN}_connected_state_changed",
-                                    {"entry_id": entry_id, "is_connected": False},
-                                )
-                        except Exception as e:
-                            _LOGGER.debug("Error disconnecting per-connection client: %s", e)
-                except Exception as e:
-                    _LOGGER.debug("Error during per-connection client cleanup: %s", e)
-                try:
-                    routes = data.setdefault("routes", {})
-                    routes.pop(mapped_uuid, None)
-                except Exception:
-                    pass
-            else:
-                # No mapped per-connection client; if no subscriptions remain, ensure legacy cleanup
-                if not subscriptions:
-                    # No active subscriptions remain; clear aggregated flags but
-                    # do NOT disconnect the legacy/shared client — letting the
-                    # integration decide when to fully disconnect avoids tearing
-                    # down other browser sessions unexpectedly.
-                    data["is_listening"] = False
-                    data["is_speaking"] = False
-                    hass.bus.async_fire(
-                        f"{DOMAIN}_listening_state_changed",
-                        {"entry_id": entry_id, "is_listening": False},
-                    )
-                    hass.bus.async_fire(
-                        f"{DOMAIN}_speaking_state_changed",
-                        {"entry_id": entry_id, "is_speaking": False},
-                    )
-        except Exception as e:
-            _LOGGER.debug("Error during on_close cleanup: %s", e)
+        
+        # NOTE: Do NOT disconnect the per-websocket client here!
+        # The on_close callback fires when a SUBSCRIPTION is cancelled, not when
+        # the actual websocket connection closes. The frontend may re-subscribe
+        # after start_listening/connect and we don't want to destroy the client.
+        # The client will be cleaned up by _disconnect_and_cleanup when stop_listening
+        # is called or when the actual websocket connection is closed.
+        _LOGGER.debug("Subscription closed for connection %s mapped_uuid=%s (client preserved)", connection_id, mapped_uuid)
 
         # Remove active connection registration
         try:

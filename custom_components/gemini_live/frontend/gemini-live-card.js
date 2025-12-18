@@ -79,7 +79,7 @@ class GeminiLiveCard extends HTMLElement {
         this._sessionResumable = false;
         this._goAwayWarning = null;
         this._resumptionHandle = null;
-        // UI flag: whether session resumption is enabled by user (default: off)
+        // UI flag: whether session resumption is enabled by user (default: on)
         this._resumptionEnabled = false;
 
         // Connection state
@@ -161,7 +161,9 @@ class GeminiLiveCard extends HTMLElement {
     }
 
     connectedCallback() {
-        this._setupSubscription();
+        // NOTE: We do NOT subscribe here on page load.
+        // Subscription happens in _connect() after the client is created.
+        // This ensures handlers are attached to the actual client, not a placeholder.
 
         // Add event listeners for auto-disconnect on page close/refresh
         window.addEventListener('beforeunload', this._handleBeforeUnload);
@@ -745,6 +747,15 @@ class GeminiLiveCard extends HTMLElement {
             this._connected = true;
             this._connecting = false;
             this._goAwayWarning = null;
+            
+            // Re-subscribe after connect to ensure handlers are attached to the new client
+            // NOTE: Do NOT call _cleanupSubscription() first - it triggers on_close
+            // which disconnects the client!
+            // Subscribe AFTER connect creates the client
+            // This is the only place we need to subscribe - handlers attach to the real client
+            await this._setupSubscription();
+            logWS('send', 'SUBSCRIBED_AFTER_CONNECT', {});
+            
             this._render();
             return true;
         } catch (e) {
@@ -770,6 +781,11 @@ class GeminiLiveCard extends HTMLElement {
             });
             this._connected = true;
             this._goAwayWarning = null;
+            
+            // Subscribe after reconnect creates the client
+            await this._setupSubscription();
+            logWS('send', 'SUBSCRIBED_AFTER_RECONNECT', {});
+            
             this._addMessage("system", "Reconnected successfully");
             this._render();
         } catch (e) {
@@ -824,6 +840,9 @@ class GeminiLiveCard extends HTMLElement {
             logWS('send', 'START_LISTENING_PAYLOAD', payload);
             const result = await this._hass.callWS(payload);
             logWS('recv', 'START_LISTENING_RESULT', result);
+
+            // NOTE: No need to subscribe here - _connect() already subscribed
+            // The client was created in connect, and subscription attached handlers to it
 
             // If backend reports listening=true, show listening state immediately
             // and clear the connecting yellow state — audio initialization will
@@ -2060,12 +2079,7 @@ class GeminiLiveCard extends HTMLElement {
                     <span class="option-label" id="mute-label">Mute while AI speaks</span>
                     <div class="toggle-switch ${this._muteWhileSpeaking ? 'active' : ''}" id="mute-toggle"></div>
                 </div>
-                
-                <div class="options-row">
-                    <span class="option-label${this._connected ? ' disabled' : ''}" id="resumption-label">Enable session resumption</span>
-                    <div class="toggle-switch ${this._resumptionEnabled ? 'active' : ''}${this._connected ? ' disabled' : ''}" id="resumption-toggle"></div>
-                </div>
-                
+
                 <div class="error-message" id="error-message" style="display: none;"></div>
             </ha-card>
         `;
